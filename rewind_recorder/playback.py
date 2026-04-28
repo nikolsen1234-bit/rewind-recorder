@@ -1,9 +1,6 @@
-from __future__ import annotations
-
 import threading
 import wave
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 from PySide6.QtCore import QThread, Signal
@@ -12,7 +9,7 @@ from PySide6.QtCore import QThread, Signal
 class AudioPlaybackWorker(QThread):
     playback_error = Signal(str)
 
-    def __init__(self, audio_path: Path, start_seconds: float, speaker_id: Optional[str]) -> None:
+    def __init__(self, audio_path: Path, start_seconds: float, speaker_id: str | None) -> None:
         super().__init__()
         self.audio_path = audio_path
         self.start_seconds = max(0.0, start_seconds)
@@ -26,12 +23,11 @@ class AudioPlaybackWorker(QThread):
         try:
             import soundcard as sc
 
-            speaker = self.selected_speaker(sc)
+            speaker = self._find_speaker(sc)
             with wave.open(str(self.audio_path), "rb") as reader:
                 sample_rate = reader.getframerate()
                 channels = reader.getnchannels()
-                sample_width = reader.getsampwidth()
-                if sample_width != 2:
+                if reader.getsampwidth() != 2:
                     raise RuntimeError("Preview playback supports 16-bit PCM WAV audio.")
 
                 start_sample = min(int(round(self.start_seconds * sample_rate)), reader.getnframes())
@@ -51,7 +47,7 @@ class AudioPlaybackWorker(QThread):
         except Exception as exc:
             self.playback_error.emit(str(exc))
 
-    def selected_speaker(self, sc) -> object:
+    def _find_speaker(self, sc) -> object:
         if self.speaker_id is None:
             return sc.default_speaker()
         for speaker in sc.all_speakers():
