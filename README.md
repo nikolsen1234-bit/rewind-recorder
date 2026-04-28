@@ -33,13 +33,7 @@ Windows 10 or 11, Python 3.11+.
 
 ## Contributing
 
-```powershell
-git clone https://github.com/nikolsen1234-bit/rewind-recorder.git
-cd rewind-recorder
-python -m pip install -e .
-```
-
-PRs welcome. [Open an issue](https://github.com/nikolsen1234-bit/rewind-recorder/issues) for bugs or feature requests.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
