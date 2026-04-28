@@ -23,6 +23,7 @@ dist/
 *.log
 
 # Local/editor files
+.secrets/
 .claude/
 .idea/
 .vscode/
