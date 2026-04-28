@@ -1,0 +1,40 @@
+# Rewind Recorder
+
+Open-source screen recorder that lets you pause, rewind, and re-record over any mistakes — no need to throw away the whole take and start from scratch. Runs locally on Windows; nothing leaves your machine.
+
+[![CI](https://github.com/nikolsen1234-bit/rewind-recorder/actions/workflows/ci.yml/badge.svg)](https://github.com/nikolsen1234-bit/rewind-recorder/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+![Rewind Recorder main window](docs/screenshot_main.png)
+
+## Install
+
+```powershell
+pip install rewind-recorder
+```
+
+Latest unreleased build:
+
+```powershell
+python -m pip install git+https://github.com/nikolsen1234-bit/rewind-recorder.git
+```
+
+## Run
+
+```powershell
+rewind-recorder
+```
+
+Drag a box around the part of your screen you want to capture, pick your mic and speakers, hit **Start Recording**. Pause whenever, drag the timeline back, and hit Record again to redo that part. Trim with **Mark In** / **Mark Out**, preview, then **Save** to MP4.
+
+## Requirements
+
+Windows 10 or 11, Python 3.11+.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+[MIT](LICENSE).
