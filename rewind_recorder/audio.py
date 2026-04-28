@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+import abc
 import queue
 import tempfile
 import threading
@@ -9,11 +8,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import Any, Self
 
 
-class MicrophoneRecorderError(RuntimeError):
-    """Raised when microphone recording cannot start or stop cleanly."""
+class AudioRecorderError(RuntimeError):
+    """Raised when audio recording cannot start or stop cleanly."""
 
 
 @dataclass(frozen=True)
@@ -30,7 +29,112 @@ class AudioRecordingInfo:
     last_status: str | None = None
 
 
-class LocalMicrophoneRecorder:
+class BaseAudioRecorder(abc.ABC):
+    """Abstract base class providing shared state and helpers for audio recorders."""
+
+    def __init__(
+        self,
+        output_path: str | Path | None = None,
+        *,
+        output_dir: str | Path | None = None,
+        sample_rate: int = 48_000,
+        channels: int = 1,
+        auto_cleanup_empty: bool = True,
+    ) -> None:
+        self.requested_output_path = Path(output_path) if output_path is not None else None
+        self.output_dir = Path(output_dir) if output_dir is not None else None
+        self.sample_rate = int(sample_rate)
+        self.channels = int(channels)
+        self.auto_cleanup_empty = auto_cleanup_empty
+
+        self._lock = threading.RLock()
+        self._output_path: Path | None = None
+        self._started_at: float | None = None
+        self._stopped_at: float | None = None
+        self._frames_written = 0
+        self._last_error: str | None = None
+        self._last_status: str | None = None
+
+    @property
+    def output_path(self) -> Path | None:
+        return self._output_path
+
+    @property
+    @abc.abstractmethod
+    def is_recording(self) -> bool:
+        ...
+
+    @property
+    def last_error(self) -> str | None:
+        return self._last_error
+
+    @property
+    def duration_seconds(self) -> float:
+        if self._started_at is None:
+            return 0.0
+        end = self._stopped_at if self._stopped_at is not None else time.perf_counter()
+        return max(0.0, end - self._started_at)
+
+    @property
+    def frames_written(self) -> int:
+        return self._frames_written
+
+    @abc.abstractmethod
+    def start(self, *, raise_on_error: bool = False) -> bool:
+        ...
+
+    @abc.abstractmethod
+    def stop(self, *, timeout: float = 5.0, raise_on_error: bool = False) -> AudioRecordingInfo:
+        ...
+
+    @abc.abstractmethod
+    def cleanup(self, *, delete_file: bool = False, timeout: float = 5.0) -> None:
+        ...
+
+    def info(self) -> AudioRecordingInfo:
+        return AudioRecordingInfo(
+            output_path=self._output_path,
+            active=self.is_recording,
+            started_at=self._started_at,
+            stopped_at=self._stopped_at,
+            duration_seconds=self.duration_seconds,
+            sample_rate=self.sample_rate,
+            channels=self.channels,
+            frames_written=self._frames_written,
+            last_error=self._last_error,
+            last_status=self._last_status,
+        )
+
+    def _resolve_output_path(self, prefix: str) -> Path:
+        if self.requested_output_path is not None:
+            return self.requested_output_path
+
+        output_dir = self.output_dir if self.output_dir is not None else Path(tempfile.gettempdir())
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        return output_dir / f"{prefix}_{stamp}.wav"
+
+    def _delete_output_file(self) -> None:
+        if self._output_path is None:
+            return
+        try:
+            self._output_path.unlink(missing_ok=True)
+        except OSError as exc:
+            self._last_error = str(exc)
+
+    def __enter__(self) -> Self:
+        self.start(raise_on_error=True)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.cleanup()
+
+
+class LocalMicrophoneRecorder(BaseAudioRecorder):
     """Record a selected local microphone/input endpoint to a PCM WAV file.
 
     The class intentionally depends only on ``sounddevice`` plus Python's
@@ -57,51 +161,27 @@ class LocalMicrophoneRecorder:
         if blocksize < 0:
             raise ValueError("blocksize cannot be negative")
 
-        self.requested_output_path = Path(output_path) if output_path is not None else None
-        self.output_dir = Path(output_dir) if output_dir is not None else None
-        self.sample_rate = int(sample_rate)
+        super().__init__(
+            output_path=output_path,
+            output_dir=output_dir,
+            sample_rate=sample_rate,
+            channels=channels,
+            auto_cleanup_empty=auto_cleanup_empty,
+        )
+
         self.requested_channels = int(channels)
-        self.channels = int(channels)
         self.device = device
         self.blocksize = int(blocksize)
-        self.auto_cleanup_empty = auto_cleanup_empty
 
-        self._lock = threading.RLock()
         self._stream: Any | None = None
         self._wave_file: wave.Wave_write | None = None
         self._writer_thread: threading.Thread | None = None
         self._writer_queue: queue.SimpleQueue[bytes | None] | None = None
         self._sd: Any | None = None
 
-        self._output_path: Path | None = None
-        self._started_at: float | None = None
-        self._stopped_at: float | None = None
-        self._frames_written = 0
-        self._last_error: str | None = None
-        self._last_status: str | None = None
-
-    @property
-    def output_path(self) -> Path | None:
-        return self._output_path
-
     @property
     def is_recording(self) -> bool:
         return self._stream is not None
-
-    @property
-    def last_error(self) -> str | None:
-        return self._last_error
-
-    @property
-    def duration_seconds(self) -> float:
-        if self._started_at is None:
-            return 0.0
-        end = self._stopped_at if self._stopped_at is not None else time.perf_counter()
-        return max(0.0, end - self._started_at)
-
-    @property
-    def frames_written(self) -> int:
-        return self._frames_written
 
     def start(self, *, raise_on_error: bool = False) -> bool:
         """Start recording.
@@ -119,7 +199,7 @@ class LocalMicrophoneRecorder:
             self._last_status = None
             self._stopped_at = None
             self._frames_written = 0
-            self._output_path = self._resolve_output_path()
+            self._output_path = self._resolve_output_path("rewind_mic")
 
             try:
                 sd = self._import_sounddevice()
@@ -155,7 +235,7 @@ class LocalMicrophoneRecorder:
                 self._last_error = str(exc)
                 self._reset_after_failed_start()
                 if raise_on_error:
-                    raise MicrophoneRecorderError(self._last_error) from exc
+                    raise AudioRecorderError(self._last_error) from exc
                 return False
 
     def stop(self, *, timeout: float = 5.0, raise_on_error: bool = False) -> AudioRecordingInfo:
@@ -172,7 +252,7 @@ class LocalMicrophoneRecorder:
             except Exception as exc:
                 self._last_error = str(exc)
                 if raise_on_error:
-                    raise MicrophoneRecorderError(self._last_error) from exc
+                    raise AudioRecorderError(self._last_error) from exc
 
         self._stopped_at = time.perf_counter() if self._started_at is not None else None
         self._close_writer(timeout=timeout)
@@ -193,45 +273,11 @@ class LocalMicrophoneRecorder:
         if delete_file:
             self._delete_output_file()
 
-    def info(self) -> AudioRecordingInfo:
-        return AudioRecordingInfo(
-            output_path=self._output_path,
-            active=self.is_recording,
-            started_at=self._started_at,
-            stopped_at=self._stopped_at,
-            duration_seconds=self.duration_seconds,
-            sample_rate=self.sample_rate,
-            channels=self.channels,
-            frames_written=self._frames_written,
-            last_error=self._last_error,
-            last_status=self._last_status,
-        )
-
-    def __enter__(self) -> LocalMicrophoneRecorder:
-        self.start(raise_on_error=True)
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        self.cleanup()
-
-    def _resolve_output_path(self) -> Path:
-        if self.requested_output_path is not None:
-            return self.requested_output_path
-
-        output_dir = self.output_dir if self.output_dir is not None else Path(tempfile.gettempdir())
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        return output_dir / f"rewind_mic_{stamp}.wav"
-
     def _import_sounddevice(self) -> Any:
         try:
             import sounddevice as sd
         except ImportError as exc:
-            raise MicrophoneRecorderError(
+            raise AudioRecorderError(
                 "Microphone recording requires the 'sounddevice' package. "
                 "Install it with: python -m pip install sounddevice"
             ) from exc
@@ -241,11 +287,11 @@ class LocalMicrophoneRecorder:
         try:
             device_info = sd.query_devices(self.device, "input")
         except Exception as exc:
-            raise MicrophoneRecorderError(f"No usable microphone input device found: {exc}") from exc
+            raise AudioRecorderError(f"No usable microphone input device found: {exc}") from exc
 
         max_channels = int(device_info.get("max_input_channels", 0))
         if max_channels < 1:
-            raise MicrophoneRecorderError("The selected input device has no microphone channels.")
+            raise AudioRecorderError("The selected input device has no microphone channels.")
 
         return min(self.requested_channels, max_channels)
 
@@ -304,14 +350,6 @@ class LocalMicrophoneRecorder:
             except Exception as exc:
                 self._last_error = str(exc)
 
-    def _delete_output_file(self) -> None:
-        if self._output_path is None:
-            return
-        try:
-            self._output_path.unlink(missing_ok=True)
-        except OSError as exc:
-            self._last_error = str(exc)
-
     def _reset_after_failed_start(self) -> None:
         stream = self._stream
         self._stream = None
@@ -326,7 +364,7 @@ class LocalMicrophoneRecorder:
             self._delete_output_file()
 
 
-class LocalSystemAudioRecorder:
+class LocalSystemAudioRecorder(BaseAudioRecorder):
     """Record a selected Windows speaker/output device through local loopback."""
 
     def __init__(
@@ -347,47 +385,24 @@ class LocalSystemAudioRecorder:
         if block_frames <= 0:
             raise ValueError("block_frames must be greater than zero")
 
-        self.requested_output_path = Path(output_path) if output_path is not None else None
-        self.output_dir = Path(output_dir) if output_dir is not None else None
-        self.sample_rate = int(sample_rate)
-        self.channels = int(channels)
+        super().__init__(
+            output_path=output_path,
+            output_dir=output_dir,
+            sample_rate=sample_rate,
+            channels=channels,
+            auto_cleanup_empty=auto_cleanup_empty,
+        )
+
         self.speaker_id = speaker_id
         self.block_frames = int(block_frames)
-        self.auto_cleanup_empty = auto_cleanup_empty
 
-        self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._ready_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._output_path: Path | None = None
-        self._started_at: float | None = None
-        self._stopped_at: float | None = None
-        self._frames_written = 0
-        self._last_error: str | None = None
-        self._last_status: str | None = None
-
-    @property
-    def output_path(self) -> Path | None:
-        return self._output_path
 
     @property
     def is_recording(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
-
-    @property
-    def last_error(self) -> str | None:
-        return self._last_error
-
-    @property
-    def duration_seconds(self) -> float:
-        if self._started_at is None:
-            return 0.0
-        end = self._stopped_at if self._stopped_at is not None else time.perf_counter()
-        return max(0.0, end - self._started_at)
-
-    @property
-    def frames_written(self) -> int:
-        return self._frames_written
 
     def start(self, *, raise_on_error: bool = False) -> bool:
         with self._lock:
@@ -415,19 +430,19 @@ class LocalSystemAudioRecorder:
                     self._last_error = "Timed out while opening the selected system audio recorder."
                     self.cleanup(delete_file=True, timeout=1.0)
                     if raise_on_error:
-                        raise MicrophoneRecorderError(self._last_error)
+                        raise AudioRecorderError(self._last_error)
                     return False
                 if self._last_error is not None:
                     error = self._last_error
                     self.cleanup(delete_file=True, timeout=1.0)
                     if raise_on_error:
-                        raise MicrophoneRecorderError(error)
+                        raise AudioRecorderError(error)
                     return False
                 if self._thread is None or not self._thread.is_alive():
                     self._last_error = "Selected system audio recorder closed before recording started."
                     self.cleanup(delete_file=True, timeout=1.0)
                     if raise_on_error:
-                        raise MicrophoneRecorderError(self._last_error)
+                        raise AudioRecorderError(self._last_error)
                     return False
                 self._started_at = time.perf_counter()
                 return True
@@ -435,7 +450,7 @@ class LocalSystemAudioRecorder:
                 self._last_error = str(exc)
                 self.cleanup(delete_file=True, timeout=1.0)
                 if raise_on_error:
-                    raise MicrophoneRecorderError(self._last_error) from exc
+                    raise AudioRecorderError(self._last_error) from exc
                 return False
 
     def stop(self, *, timeout: float = 5.0, raise_on_error: bool = False) -> AudioRecordingInfo:
@@ -446,7 +461,7 @@ class LocalSystemAudioRecorder:
             if thread.is_alive():
                 self._last_error = "Timed out while closing the system audio recorder."
                 if raise_on_error:
-                    raise MicrophoneRecorderError(self._last_error)
+                    raise AudioRecorderError(self._last_error)
         self._thread = None
         self._stopped_at = time.perf_counter() if self._started_at is not None else None
 
@@ -460,28 +475,6 @@ class LocalSystemAudioRecorder:
             self.stop(timeout=timeout)
         if delete_file:
             self._delete_output_file()
-
-    def info(self) -> AudioRecordingInfo:
-        return AudioRecordingInfo(
-            output_path=self._output_path,
-            active=self.is_recording,
-            started_at=self._started_at,
-            stopped_at=self._stopped_at,
-            duration_seconds=self.duration_seconds,
-            sample_rate=self.sample_rate,
-            channels=self.channels,
-            frames_written=self._frames_written,
-            last_error=self._last_error,
-            last_status=self._last_status,
-        )
-
-    def _resolve_output_path(self, prefix: str) -> Path:
-        if self.requested_output_path is not None:
-            return self.requested_output_path
-
-        output_dir = self.output_dir if self.output_dir is not None else Path(tempfile.gettempdir())
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        return output_dir / f"{prefix}_{stamp}.wav"
 
     def _record_loop(self) -> None:
         try:
@@ -533,12 +526,4 @@ class LocalSystemAudioRecorder:
         for speaker in sc.all_speakers():
             if speaker.id == self.speaker_id or speaker.name == self.speaker_id:
                 return speaker
-        raise MicrophoneRecorderError("Selected output/system audio device was not found.")
-
-    def _delete_output_file(self) -> None:
-        if self._output_path is None:
-            return
-        try:
-            self._output_path.unlink(missing_ok=True)
-        except OSError as exc:
-            self._last_error = str(exc)
+        raise AudioRecorderError("Selected output/system audio device was not found.")

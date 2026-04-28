@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import threading
 import time
 
@@ -9,6 +7,7 @@ import numpy as np
 from PySide6.QtCore import QThread, Signal
 
 from rewind_recorder.project import FrameProject
+from rewind_recorder.types import CaptureArea
 from rewind_recorder.windows_api import draw_cursor_overlay
 
 
@@ -16,10 +15,10 @@ class CaptureWorker(QThread):
     frame_saved = Signal(int)
     capture_error = Signal(str)
 
-    def __init__(self, project: FrameProject, area: dict[str, int], fps: int) -> None:
+    def __init__(self, project: FrameProject, area: CaptureArea, fps: int) -> None:
         super().__init__()
         self.project = project
-        self.area = area.copy()
+        self.area = area
         self.fps = fps
         self._stop_event = threading.Event()
 
@@ -27,12 +26,7 @@ class CaptureWorker(QThread):
         self._stop_event.set()
 
     def run(self) -> None:
-        monitor = {
-            "left": self.area["x"],
-            "top": self.area["y"],
-            "width": self.area["width"],
-            "height": self.area["height"],
-        }
+        monitor = self.area.to_monitor()
         frame_interval = 1.0 / max(1, self.fps)
 
         try:
