@@ -1,6 +1,6 @@
 # Rewind Recorder
 
-A Windows screen recorder that lets you stop, jump back, and re-record over any part you messed up — no need to throw away the whole take and start from scratch.
+Open-source screen recorder that lets you pause, rewind, and re-record over any mistakes — no need to throw away the whole take and start from scratch. Runs locally on Windows; nothing leaves your machine.
 
 [![CI](https://github.com/nikolsen1234-bit/rewind-recorder/actions/workflows/ci.yml/badge.svg)](https://github.com/nikolsen1234-bit/rewind-recorder/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
