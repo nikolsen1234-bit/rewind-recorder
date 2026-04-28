@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Preview now scales correctly when the window is resized.
+
+### Changed
+
+- Removed dead `record_button` code (was never shown in UI).
+- Deduplicated identical `_primary_action` / `_record_or_resume` methods.
+- Merged `autosave.save()` and `save_with_locked_area()` into one method.
+- Cleaned up layout spacing for consistency.
+- Removed unused imports and unnecessary docstrings.
+
 ## [0.1.0] - 2026-04-28
 
 ### Added
