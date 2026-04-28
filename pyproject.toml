@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rewind-recorder"
+version = "0.1.0"
+description = "Local Windows screen recorder with rewind-and-overwrite editing."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Rewind Recorder contributors" }
+]
+keywords = ["screen-recorder", "windows", "pyside6", "opencv", "mss"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video :: Capture",
+]
+dependencies = [
+    "PySide6",
+    "mss",
+    "opencv-python",
+    "numpy",
+    "sounddevice",
+    "soundcard",
+    "imageio-ffmpeg",
+]
+
+[project.urls]
+Homepage = "https://github.com/nikolsen1234-bit/rewind-recorder"
+Repository = "https://github.com/nikolsen1234-bit/rewind-recorder"
+Issues = "https://github.com/nikolsen1234-bit/rewind-recorder/issues"
+
+[project.gui-scripts]
+rewind-recorder = "rewind_recorder.app:main"
+
+[tool.setuptools.packages.find]
+include = ["rewind_recorder*"]

@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+
+# Local recorder output
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wav
+*.tmp
+*.log
+
+# Local/editor files
+.secrets/
+.claude/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Test/cache output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Superpowers workflow scaffolding (specs, plans)
+docs/superpowers/
