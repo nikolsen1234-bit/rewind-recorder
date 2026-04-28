@@ -96,6 +96,9 @@ class MainWindow(QMainWindow):
 
         result = self.autosaver.restore()
         if result.restored:
+            self.audio.fps = self.project.fps
+            self.exporter.fps = self.project.fps
+            self.preview_ctrl._timer.setInterval(max(1, int(round(1000 / self.project.fps))))
             self.locked_capture_area = result.locked_area
             self._update_status("Restored previous recording")
             self._sync_overlay(apply_geometry=True)
@@ -149,6 +152,7 @@ class MainWindow(QMainWindow):
         self.refresh_audio_button.clicked.connect(self._refresh_audio_devices)
 
         self.select_button = QPushButton(self._icon("mdi6.target"), " Select Area")
+        self.record_button = QPushButton(self._icon("mdi6.record-circle-outline"), " Record")
         self.import_button = QPushButton(self._icon("mdi6.file-import-outline"), " Import")
         self.play_preview_button = QPushButton(self._icon("mdi6.play"), " Play")
         self.stop_button = QPushButton(self._icon("mdi6.stop"), " Stop")
@@ -159,7 +163,7 @@ class MainWindow(QMainWindow):
         self.clear_cut_button = QPushButton(self._icon("mdi6.close-circle-outline"), " Clear Range")
 
         for btn in (
-            self.select_button, self.import_button,
+            self.select_button, self.record_button, self.import_button,
             self.play_preview_button, self.stop_button, self.save_button,
             self.cut_start_button, self.cut_end_button,
             self.delete_cut_button, self.clear_cut_button,
@@ -168,6 +172,7 @@ class MainWindow(QMainWindow):
             btn.setStyleSheet(_BUTTON_STYLE)
 
         self.select_button.clicked.connect(self._select_area)
+        self.record_button.clicked.connect(self._record_or_resume)
         self.floating_control.primary_clicked.connect(self._record_or_resume)
         self.import_button.clicked.connect(self._import_clip)
         self.play_preview_button.clicked.connect(self._toggle_preview)
@@ -234,6 +239,7 @@ class MainWindow(QMainWindow):
         pb_btns = QHBoxLayout()
         pb_btns.setSpacing(6)
         pb_btns.addWidget(self.select_button)
+        pb_btns.addWidget(self.record_button)
         pb_btns.addWidget(self.play_preview_button)
         pb_btns.addWidget(self.stop_button)
         playback_col.addLayout(pb_btns)
@@ -883,6 +889,7 @@ class MainWindow(QMainWindow):
         can_edit = not recording and has_frames
 
         self.select_button.setEnabled(not recording and not busy and not playing)
+        self.record_button.setEnabled(has_area and not busy and not playing and state is not RecorderState.RECORDING)
         self.play_preview_button.setEnabled(can_edit and not busy)
         if playing:
             self.play_preview_button.setIcon(self._icon("mdi6.stop"))
