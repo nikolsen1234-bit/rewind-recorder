@@ -32,6 +32,7 @@ dependencies = [
     "sounddevice",
     "soundcard",
     "imageio-ffmpeg",
+    "qtawesome",
 ]
 
 [project.urls]
