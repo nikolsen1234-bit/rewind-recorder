@@ -1,31 +1,33 @@
+from __future__ import annotations
+
 import shutil
 import tempfile
 import threading
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
 
-from rewind_recorder.config import DEFAULT_FPS, JPEG_QUALITY, RecorderState
-from rewind_recorder.types import CaptureArea
+from rewind_recorder.config import DEFAULT_FPS, JPEG_QUALITY, STATE_IDLE
 
 
 class FrameProject:
     def __init__(self, fps: int = DEFAULT_FPS) -> None:
         self.fps = fps
-        self.area: CaptureArea | None = None
-        self.temp_dir: Path | None = None
+        self.area: Optional[dict[str, int]] = None
+        self.temp_dir: Optional[Path] = None
         self.frames: list[Path] = []
         self.timeline_index = 0
-        self.state = RecorderState.IDLE
-        self.cut_start: int | None = None
-        self.cut_end: int | None = None
+        self.state = STATE_IDLE
+        self.cut_start: Optional[int] = None
+        self.cut_end: Optional[int] = None
         self.next_frame_id = 0
         self._lock = threading.RLock()
 
-    def set_area(self, area: CaptureArea) -> None:
+    def set_area(self, area: dict[str, int]) -> None:
         with self._lock:
-            self.area = area
+            self.area = area.copy()
 
     def ensure_temp_dir(self) -> Path:
         with self._lock:
@@ -44,13 +46,16 @@ class FrameProject:
         with self._lock:
             return list(self.frames)
 
-    def preview_frame_path(self, timeline_index: int) -> Path | None:
+    def preview_frame_path(self, timeline_index: int) -> Optional[Path]:
         with self._lock:
             if not self.frames:
                 return None
+
             if timeline_index <= 0:
-                return self.frames[0]
-            return self.frames[min(timeline_index - 1, len(self.frames) - 1)]
+                frame_index = 0
+            else:
+                frame_index = min(timeline_index - 1, len(self.frames) - 1)
+            return self.frames[frame_index]
 
     def get_timeline_index(self) -> int:
         with self._lock:

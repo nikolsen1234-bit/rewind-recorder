@@ -1,16 +1,19 @@
+from __future__ import annotations
+
 import ctypes
 import sys
+from typing import Optional
 
 import cv2
 import numpy as np
 from PySide6.QtWidgets import QWidget
 
-from rewind_recorder.types import CaptureArea
-
 
 def enable_windows_dpi_awareness() -> None:
+    """Keep Qt mouse coordinates aligned with mss screen-capture coordinates."""
     if sys.platform != "win32":
         return
+
     try:
         ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
     except Exception:
@@ -18,7 +21,6 @@ def enable_windows_dpi_awareness() -> None:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
-
 
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
@@ -87,7 +89,7 @@ BI_RGB = 0
 DI_NORMAL = 0x0003
 
 
-def _configure_api() -> None:
+def configure_windows_api() -> None:
     if sys.platform != "win32":
         return
 
@@ -99,8 +101,15 @@ def _configure_api() -> None:
     user32.GetIconInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(ICONINFO)]
     user32.GetIconInfo.restype = ctypes.c_bool
     user32.DrawIconEx.argtypes = [
-        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
-        ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.c_uint,
     ]
     user32.DrawIconEx.restype = ctypes.c_bool
     user32.GetDC.argtypes = [ctypes.c_void_p]
@@ -110,16 +119,25 @@ def _configure_api() -> None:
     user32.SetWindowDisplayAffinity.argtypes = [ctypes.c_void_p, ctypes.c_uint]
     user32.SetWindowDisplayAffinity.restype = ctypes.c_bool
     user32.SetWindowPos.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
-        ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
     ]
     user32.SetWindowPos.restype = ctypes.c_bool
 
     gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
     gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
     gdi32.CreateDIBSection.argtypes = [
-        ctypes.c_void_p, ctypes.POINTER(BITMAPINFO), ctypes.c_uint,
-        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.POINTER(BITMAPINFO),
+        ctypes.c_uint,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.c_uint32,
     ]
     gdi32.CreateDIBSection.restype = ctypes.c_void_p
     gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
@@ -130,12 +148,13 @@ def _configure_api() -> None:
     gdi32.DeleteDC.restype = ctypes.c_bool
 
 
-_configure_api()
+configure_windows_api()
 
 
-def get_cursor_info() -> CURSORINFO | None:
+def get_cursor_info() -> Optional[CURSORINFO]:
     if sys.platform != "win32":
         return None
+
     cursor_info = CURSORINFO()
     cursor_info.cbSize = ctypes.sizeof(CURSORINFO)
     if not ctypes.windll.user32.GetCursorInfo(ctypes.byref(cursor_info)):
@@ -145,13 +164,13 @@ def get_cursor_info() -> CURSORINFO | None:
     return cursor_info
 
 
-def draw_cursor_overlay(frame: np.ndarray, area: CaptureArea) -> None:
+def draw_cursor_overlay(frame: np.ndarray, area: dict[str, int]) -> None:
     cursor_info = get_cursor_info()
     if cursor_info is None or not cursor_info.hCursor:
         return
 
-    cursor_x = int(cursor_info.ptScreenPos.x) - area.x
-    cursor_y = int(cursor_info.ptScreenPos.y) - area.y
+    cursor_x = int(cursor_info.ptScreenPos.x) - area["x"]
+    cursor_y = int(cursor_info.ptScreenPos.y) - area["y"]
     height, width = frame.shape[:2]
     if cursor_x < -32 or cursor_y < -32 or cursor_x >= width + 32 or cursor_y >= height + 32:
         return
@@ -165,7 +184,7 @@ def draw_cursor_overlay(frame: np.ndarray, area: CaptureArea) -> None:
         hotspot_y = int(icon_info.yHotspot)
 
     try:
-        _draw_windows_cursor(frame, cursor_info.hCursor, cursor_x - hotspot_x, cursor_y - hotspot_y)
+        draw_windows_cursor(frame, cursor_info.hCursor, cursor_x - hotspot_x, cursor_y - hotspot_y)
     finally:
         if got_icon_info:
             if icon_info.hbmMask:
@@ -174,7 +193,7 @@ def draw_cursor_overlay(frame: np.ndarray, area: CaptureArea) -> None:
                 ctypes.windll.gdi32.DeleteObject(icon_info.hbmColor)
 
 
-def _draw_windows_cursor(frame: np.ndarray, cursor_handle: int, x: int, y: int) -> None:
+def draw_windows_cursor(frame: np.ndarray, cursor_handle: int, x: int, y: int) -> None:
     height, width = frame.shape[:2]
     bgra = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
     bgra = np.ascontiguousarray(bgra)
@@ -191,8 +210,12 @@ def _draw_windows_cursor(frame: np.ndarray, cursor_handle: int, x: int, y: int) 
     screen_dc = ctypes.windll.user32.GetDC(None)
     mem_dc = ctypes.windll.gdi32.CreateCompatibleDC(screen_dc)
     bitmap = ctypes.windll.gdi32.CreateDIBSection(
-        mem_dc, ctypes.byref(bitmap_info), DIB_RGB_COLORS,
-        ctypes.byref(bits), None, 0,
+        mem_dc,
+        ctypes.byref(bitmap_info),
+        DIB_RGB_COLORS,
+        ctypes.byref(bits),
+        None,
+        0,
     )
     if screen_dc:
         ctypes.windll.user32.ReleaseDC(None, screen_dc)
@@ -220,6 +243,7 @@ def _draw_windows_cursor(frame: np.ndarray, cursor_handle: int, x: int, y: int) 
 def exclude_widget_from_capture(widget: QWidget) -> bool:
     if sys.platform != "win32":
         return False
+
     try:
         hwnd = int(widget.winId())
         return bool(ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE))
@@ -231,6 +255,7 @@ def force_widget_topmost(widget: QWidget) -> None:
     widget.raise_()
     if sys.platform != "win32":
         return
+
     try:
         hwnd = int(widget.winId())
         flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
