@@ -33,3 +33,4 @@ python -m rewind_recorder
 - Keep changes focused — one topic per PR.
 - Make sure CI passes.
 - If you add a user-facing change, update `CHANGELOG.md` under `[Unreleased]`.
+- For releases: bundle all changes (fixes, version bump, changelog) into a single PR and squash-merge it. One release = one commit in main.
