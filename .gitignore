@@ -33,3 +33,6 @@ Thumbs.db
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Superpowers workflow scaffolding (specs, plans)
+docs/superpowers/
