@@ -25,7 +25,7 @@ python -m pip install git+https://github.com/nikolsen1234-bit/rewind-recorder.gi
 rewind-recorder
 ```
 
-Pick a screen region, choose audio devices, hit **Start Recording**. Pause whenever, drag the timeline back, hit Record again to redo that part. Trim with **Mark In** / **Mark Out**, preview, then **Save** to MP4.
+Drag a box around the part of your screen you want to capture, pick your mic and speakers, hit **Start Recording**. Pause whenever, drag the timeline back, and hit Record again to redo that part. Trim with **Mark In** / **Mark Out**, preview, then **Save** to MP4.
 
 ## Requirements
 
