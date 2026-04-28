@@ -12,7 +12,7 @@ from typing import Any, Self
 
 
 class AudioRecorderError(RuntimeError):
-    """Raised when audio recording cannot start or stop cleanly."""
+    pass
 
 
 @dataclass(frozen=True)
@@ -30,7 +30,6 @@ class AudioRecordingInfo:
 
 
 class BaseAudioRecorder(abc.ABC):
-    """Abstract base class providing shared state and helpers for audio recorders."""
 
     def __init__(
         self,
@@ -135,13 +134,6 @@ class BaseAudioRecorder(abc.ABC):
 
 
 class LocalMicrophoneRecorder(BaseAudioRecorder):
-    """Record a selected local microphone/input endpoint to a PCM WAV file.
-
-    The class intentionally depends only on ``sounddevice`` plus Python's
-    standard ``wave`` module. ``sounddevice`` is imported lazily so the main
-    application can still launch on systems where microphone recording is not
-    installed or available.
-    """
 
     def __init__(
         self,
@@ -184,13 +176,6 @@ class LocalMicrophoneRecorder(BaseAudioRecorder):
         return self._stream is not None
 
     def start(self, *, raise_on_error: bool = False) -> bool:
-        """Start recording.
-
-        Returns ``True`` when audio capture starts. Returns ``False`` and stores
-        a human-readable ``last_error`` when dependencies, devices, or streams
-        are unavailable. Pass ``raise_on_error=True`` to raise instead.
-        """
-
         with self._lock:
             if self.is_recording:
                 return True
@@ -239,8 +224,6 @@ class LocalMicrophoneRecorder(BaseAudioRecorder):
                 return False
 
     def stop(self, *, timeout: float = 5.0, raise_on_error: bool = False) -> AudioRecordingInfo:
-        """Stop recording and close the WAV file."""
-
         with self._lock:
             stream = self._stream
             self._stream = None
@@ -263,8 +246,6 @@ class LocalMicrophoneRecorder(BaseAudioRecorder):
         return self.info()
 
     def cleanup(self, *, delete_file: bool = False, timeout: float = 5.0) -> None:
-        """Release resources, optionally deleting the recorded WAV file."""
-
         if self.is_recording:
             self.stop(timeout=timeout)
         else:
@@ -365,7 +346,6 @@ class LocalMicrophoneRecorder(BaseAudioRecorder):
 
 
 class LocalSystemAudioRecorder(BaseAudioRecorder):
-    """Record a selected Windows speaker/output device through local loopback."""
 
     def __init__(
         self,

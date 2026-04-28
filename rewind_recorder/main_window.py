@@ -1,9 +1,7 @@
-import sys
 from pathlib import Path
 from typing import Any
 
 import cv2
-import numpy as np
 import qtawesome as qta
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPixmap
@@ -58,7 +56,7 @@ QPushButton:disabled {
 }
 """
 
-_SECTION_STYLE = "font-weight: 700; font-size: 15px; color: #ccc; margin-top: 2px;"
+_SECTION_STYLE = "font-weight: 700; font-size: 14px; color: #ccc;"
 _SUBLABEL_STYLE = "color: #888; font-size: 12px;"
 
 
@@ -117,7 +115,7 @@ class MainWindow(QMainWindow):
         central = QWidget()
         central.setStyleSheet("background: #181818;")
         layout = QVBoxLayout(central)
-        layout.setSpacing(0)
+        layout.setSpacing(6)
         layout.setContentsMargins(16, 12, 16, 12)
 
         self.time_label = QLabel("00:00.000 / 00:00.000")
@@ -128,11 +126,13 @@ class MainWindow(QMainWindow):
 
         self.preview_label = QLabel("Preview appears here after frames are recorded")
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumSize(480, 270)
+        self.preview_label.setMinimumSize(320, 180)
         self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview_label.setScaledContents(False)
         self.preview_label.setStyleSheet(
             "QLabel { background: #0a0a0a; color: #666; border: 1px solid #333; border-radius: 6px; }"
         )
+        self._last_preview_frame: QImage | None = None
 
         self.timeline = TrimTimeline()
         self.timeline.setRange(0, 0)
@@ -149,7 +149,6 @@ class MainWindow(QMainWindow):
         self.refresh_audio_button.clicked.connect(self._refresh_audio_devices)
 
         self.select_button = QPushButton(self._icon("mdi6.target"), " Select Area")
-        self.record_button = QPushButton("Start Recording")
         self.import_button = QPushButton(self._icon("mdi6.file-import-outline"), " Import")
         self.play_preview_button = QPushButton(self._icon("mdi6.play"), " Play")
         self.stop_button = QPushButton(self._icon("mdi6.stop"), " Stop")
@@ -160,7 +159,7 @@ class MainWindow(QMainWindow):
         self.clear_cut_button = QPushButton(self._icon("mdi6.close-circle-outline"), " Clear Range")
 
         for btn in (
-            self.select_button, self.record_button, self.import_button,
+            self.select_button, self.import_button,
             self.play_preview_button, self.stop_button, self.save_button,
             self.cut_start_button, self.cut_end_button,
             self.delete_cut_button, self.clear_cut_button,
@@ -169,8 +168,7 @@ class MainWindow(QMainWindow):
             btn.setStyleSheet(_BUTTON_STYLE)
 
         self.select_button.clicked.connect(self._select_area)
-        self.floating_control.primary_clicked.connect(self._primary_action)
-        self.record_button.clicked.connect(self._record_or_resume)
+        self.floating_control.primary_clicked.connect(self._record_or_resume)
         self.import_button.clicked.connect(self._import_clip)
         self.play_preview_button.clicked.connect(self._toggle_preview)
         self.stop_button.clicked.connect(self._stop_recording)
@@ -258,13 +256,11 @@ class MainWindow(QMainWindow):
         bottom_row.addLayout(actions_col, 1)
 
         layout.addLayout(audio_row)
-        layout.addSpacing(8)
         layout.addWidget(self.preview_label, 1)
-        layout.addSpacing(8)
         layout.addLayout(timeline_header)
         layout.addWidget(self.timeline)
         layout.addWidget(self.time_label)
-        layout.addSpacing(20)
+        layout.addSpacing(8)
         layout.addLayout(bottom_row)
 
         self.setCentralWidget(central)
@@ -386,15 +382,6 @@ class MainWindow(QMainWindow):
         self._update_controls()
 
     def _record_or_resume(self) -> None:
-        self.preview_ctrl.stop()
-        if self.project.state is RecorderState.RECORDING:
-            self._pause_recording()
-        elif self.project.state is RecorderState.PAUSED:
-            self._resume_from_here()
-        else:
-            self._start_recording()
-
-    def _primary_action(self) -> None:
         self.preview_ctrl.stop()
         if self.project.state is RecorderState.RECORDING:
             self._pause_recording()
@@ -833,26 +820,34 @@ class MainWindow(QMainWindow):
         index = self.project.get_timeline_index()
 
         if count == 0:
+            self._last_preview_frame = None
             self.preview_label.setPixmap(QPixmap())
             self.preview_label.setText("Preview appears here after frames are recorded")
             return
 
         path = self.project.preview_frame_path(index)
         if path is None:
+            self._last_preview_frame = None
             self.preview_label.setPixmap(QPixmap())
             self.preview_label.setText("Preview unavailable")
             return
 
         frame = cv2.imread(str(path))
         if frame is None:
+            self._last_preview_frame = None
             self.preview_label.setPixmap(QPixmap())
             self.preview_label.setText("Could not read preview frame")
             return
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
-        qimage = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
-        pixmap = QPixmap.fromImage(qimage).scaled(
+        self._last_preview_frame = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
+        self._scale_preview_to_label()
+
+    def _scale_preview_to_label(self) -> None:
+        if self._last_preview_frame is None:
+            return
+        pixmap = QPixmap.fromImage(self._last_preview_frame).scaled(
             self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation,
         )
         self.preview_label.setPixmap(pixmap)
@@ -924,7 +919,7 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
-        self._update_preview()
+        self._scale_preview_to_label()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self.preview_ctrl.stop()
@@ -936,7 +931,7 @@ class MainWindow(QMainWindow):
 
         try:
             if self.project.has_frames() or self.project.area is not None:
-                self.autosaver.save_with_locked_area(self.locked_capture_area)
+                self.autosaver.save(self.locked_capture_area)
             else:
                 self.autosaver.clear()
         except Exception as exc:

@@ -23,29 +23,7 @@ class AutosaveManager:
         self.project = project
         self.audio = audio
 
-    def save(self) -> None:
-        path = self._autosave_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        data = {
-            "version": 1,
-            "fps": self.project.fps,
-            "area": self._area_to_dict(self.project.area),
-            "locked_capture_area": None,
-            "temp_dir": str(self.project.temp_dir) if self.project.temp_dir is not None else None,
-            "frames": [str(p) for p in self.project.snapshot_frame_paths()],
-            "timeline_index": self.project.get_timeline_index(),
-            "cut_start": self.project.cut_start,
-            "cut_end": self.project.cut_end,
-            "next_frame_id": self.project.next_frame_id,
-            "audio_segments": [seg.to_json() for seg in self.audio.segments],
-        }
-
-        temp = path.with_suffix(".tmp")
-        temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        temp.replace(path)
-
-    def save_with_locked_area(self, locked_area: CaptureArea | None) -> None:
+    def save(self, locked_area: CaptureArea | None = None) -> None:
         path = self._autosave_path()
         path.parent.mkdir(parents=True, exist_ok=True)
 
