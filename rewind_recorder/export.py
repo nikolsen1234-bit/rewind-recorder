@@ -1,3 +1,4 @@
+import logging
 import shutil
 import subprocess
 import sys
@@ -12,6 +13,12 @@ from rewind_recorder.config import AUDIO_SAMPLE_RATE, DEFAULT_OUTPUT_HEIGHT, DEF
 from rewind_recorder.errors import VideoWriterOpenError
 from rewind_recorder.types import AudioSegment
 
+_log = logging.getLogger(__name__)
+_FFMPEG_TIMEOUT_SECONDS = 3600
+
+
+_UNRESOLVED = object()
+
 
 @dataclass(frozen=True)
 class ExportResult:
@@ -22,9 +29,10 @@ class ExportResult:
 
 class VideoExporter:
     def __init__(self, fps: int) -> None:
-        self.fps = fps
+        self.fps = max(1, int(fps))
         self.output_width = DEFAULT_OUTPUT_WIDTH
         self.output_height = DEFAULT_OUTPUT_HEIGHT
+        self._ffmpeg_path: str | None | object = _UNRESOLVED
 
     def export(
         self,
@@ -44,6 +52,7 @@ class VideoExporter:
 
         final_path, muxed, detail = self._mux_audio(video_path, audio_path)
         if not muxed:
+            audio_path.unlink(missing_ok=True)
             raise RuntimeError(
                 "This recording has audio, but the audio could not be embedded into the video.\n\n"
                 f"{detail}"
@@ -120,11 +129,7 @@ class VideoExporter:
             str(output_path),
         ])
 
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        result = subprocess.run(
-            command, capture_output=True, text=True,
-            creationflags=creationflags, timeout=3600,
-        )
+        result = self._run_ffmpeg(command)
         if result.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
             output_path.unlink(missing_ok=True)
             detail = result.stderr.strip() or result.stdout.strip() or "FFmpeg did not create mixed audio."
@@ -136,9 +141,17 @@ class VideoExporter:
         if not frame_paths:
             raise RuntimeError("No frames are available.")
 
-        first_frame = cv2.imread(str(frame_paths[0]))
+        first_frame = None
+        for candidate in frame_paths:
+            try:
+                first_frame = cv2.imread(str(candidate))
+            except Exception as exc:
+                _log.warning("cv2.imread raised on %s: %s", candidate, exc)
+                first_frame = None
+            if first_frame is not None:
+                break
         if first_frame is None:
-            raise RuntimeError(f"Could not read first frame: {frame_paths[0]}")
+            raise RuntimeError("Could not read any recorded frame.")
 
         height, width = first_frame.shape[:2]
         fps = float(self.fps)
@@ -171,14 +184,26 @@ class VideoExporter:
             raise VideoWriterOpenError(f"OpenCV could not open a {codec} writer for {output_path}")
 
         completed = False
+        written = 0
+        skipped = 0
         try:
             for frame_path in frame_paths:
-                frame = cv2.imread(str(frame_path))
+                try:
+                    frame = cv2.imread(str(frame_path))
+                except Exception as exc:
+                    _log.warning("cv2.imread raised on %s: %s", frame_path, exc)
+                    frame = None
                 if frame is None:
-                    raise RuntimeError(f"Could not read frame: {frame_path}")
+                    skipped += 1
+                    continue
                 if frame.shape[1] != source_width or frame.shape[0] != source_height:
                     frame = cv2.resize(frame, (source_width, source_height), interpolation=cv2.INTER_AREA)
                 writer.write(self._frame_to_canvas(frame))
+                written += 1
+            if written == 0:
+                raise RuntimeError("No frames could be read for export.")
+            if skipped:
+                _log.warning("Export skipped %d unreadable frame(s) of %d", skipped, len(frame_paths))
             completed = True
         finally:
             writer.release()
@@ -229,11 +254,7 @@ class VideoExporter:
             "-c:a", "aac", "-b:a", "192k",
             str(temp_output),
         ]
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        result = subprocess.run(
-            command, capture_output=True, text=True,
-            creationflags=creationflags, timeout=3600,
-        )
+        result = self._run_ffmpeg(command)
         if result.returncode != 0 or not temp_output.exists() or temp_output.stat().st_size == 0:
             temp_output.unlink(missing_ok=True)
             detail = result.stderr.strip() or result.stdout.strip() or "FFmpeg did not create an output file."
@@ -272,14 +293,47 @@ class VideoExporter:
         return output_path
 
     def _find_ffmpeg(self) -> str | None:
-        path = shutil.which("ffmpeg")
-        if path:
-            return path
+        if self._ffmpeg_path is not _UNRESOLVED:
+            return self._ffmpeg_path  # type: ignore[return-value]
+
         try:
-            import imageio_ffmpeg
-            return imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception:
-            return None
+            path = shutil.which("ffmpeg")
+        except Exception as exc:
+            _log.warning("shutil.which('ffmpeg') failed: %s", exc)
+            path = None
+
+        if not path:
+            try:
+                import imageio_ffmpeg
+                path = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception as exc:
+                _log.warning("imageio_ffmpeg lookup failed: %s", exc)
+                path = None
+
+        self._ffmpeg_path = path
+        if path is None:
+            _log.error("FFmpeg binary not found on PATH or via imageio_ffmpeg")
+        else:
+            _log.info("Using FFmpeg at %s", path)
+        return path
+
+    def _run_ffmpeg(self, command: list[str]) -> subprocess.CompletedProcess:
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        try:
+            return subprocess.run(
+                command, capture_output=True, text=True,
+                creationflags=creationflags, timeout=_FFMPEG_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stderr = (exc.stderr or "").strip() if isinstance(exc.stderr, str) else ""
+            stdout = (exc.stdout or "").strip() if isinstance(exc.stdout, str) else ""
+            detail = stderr or stdout or "no output captured"
+            raise RuntimeError(
+                f"FFmpeg did not finish within {_FFMPEG_TIMEOUT_SECONDS}s and was terminated. {detail}"
+            ) from exc
+        except FileNotFoundError as exc:
+            self._ffmpeg_path = _UNRESOLVED
+            raise RuntimeError(f"FFmpeg executable disappeared: {exc}") from exc
 
     def _unique_path(self, path: Path) -> Path:
         if not path.exists():

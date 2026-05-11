@@ -1,4 +1,5 @@
 import abc
+import logging
 import queue
 import tempfile
 import threading
@@ -9,6 +10,9 @@ from datetime import datetime
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
+
+_log = logging.getLogger(__name__)
+_MIC_QUEUE_MAX_BLOCKS = 1024
 
 
 class AudioRecorderError(RuntimeError):
@@ -168,8 +172,9 @@ class LocalMicrophoneRecorder(BaseAudioRecorder):
         self._stream: Any | None = None
         self._wave_file: wave.Wave_write | None = None
         self._writer_thread: threading.Thread | None = None
-        self._writer_queue: queue.SimpleQueue[bytes | None] | None = None
+        self._writer_queue: queue.Queue[bytes | None] | None = None
         self._sd: Any | None = None
+        self._dropped_blocks = 0
 
     @property
     def is_recording(self) -> bool:
@@ -197,7 +202,8 @@ class LocalMicrophoneRecorder(BaseAudioRecorder):
                 self._wave_file.setsampwidth(2)
                 self._wave_file.setframerate(self.sample_rate)
 
-                self._writer_queue = queue.SimpleQueue()
+                self._writer_queue = queue.Queue(maxsize=_MIC_QUEUE_MAX_BLOCKS)
+                self._dropped_blocks = 0
                 self._writer_thread = threading.Thread(
                     target=self._writer_loop,
                     name="LocalMicrophoneRecorderWriter",
@@ -229,13 +235,20 @@ class LocalMicrophoneRecorder(BaseAudioRecorder):
             self._stream = None
 
         if stream is not None:
+            stop_exc: Exception | None = None
             try:
                 stream.stop()
+            except Exception as exc:
+                stop_exc = exc
+                self._last_error = str(exc)
+                _log.warning("sounddevice stream.stop() failed: %s", exc)
+            try:
                 stream.close()
             except Exception as exc:
                 self._last_error = str(exc)
-                if raise_on_error:
-                    raise AudioRecorderError(self._last_error) from exc
+                _log.warning("sounddevice stream.close() failed: %s", exc)
+            if stop_exc is not None and raise_on_error:
+                raise AudioRecorderError(str(stop_exc)) from stop_exc
 
         self._stopped_at = time.perf_counter() if self._started_at is not None else None
         self._close_writer(timeout=timeout)
@@ -285,9 +298,24 @@ class LocalMicrophoneRecorder(BaseAudioRecorder):
             return
 
         try:
-            writer_queue.put(bytes(indata))
+            payload = bytes(indata)
+        except Exception as exc:
+            self._last_error = f"audio block conversion failed: {exc}"
+            _log.warning(self._last_error)
+            return
+
+        try:
+            writer_queue.put_nowait(payload)
+        except queue.Full:
+            self._dropped_blocks += 1
+            if self._dropped_blocks % 50 == 1:
+                self._last_status = (
+                    f"dropping audio blocks (writer is behind, {self._dropped_blocks} so far)"
+                )
+                _log.warning(self._last_status)
         except Exception as exc:
             self._last_error = str(exc)
+            _log.warning("audio queue put failed: %s", exc)
 
     def _writer_loop(self) -> None:
         writer_queue = self._writer_queue
@@ -295,7 +323,12 @@ class LocalMicrophoneRecorder(BaseAudioRecorder):
             return
 
         while True:
-            chunk = writer_queue.get()
+            try:
+                chunk = writer_queue.get()
+            except Exception as exc:
+                self._last_error = f"audio writer queue read failed: {exc}"
+                _log.exception(self._last_error)
+                return
             if chunk is None:
                 break
 
@@ -303,7 +336,12 @@ class LocalMicrophoneRecorder(BaseAudioRecorder):
             if wave_file is None:
                 continue
 
-            wave_file.writeframes(chunk)
+            try:
+                wave_file.writeframes(chunk)
+            except Exception as exc:
+                self._last_error = f"audio writer failed: {exc}"
+                _log.exception(self._last_error)
+                return
             bytes_per_frame = self.channels * 2
             if bytes_per_frame > 0:
                 self._frames_written += len(chunk) // bytes_per_frame

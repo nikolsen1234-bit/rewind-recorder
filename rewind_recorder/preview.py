@@ -40,6 +40,9 @@ class PreviewController(QObject):
     def is_playing(self) -> bool:
         return self._timer.isActive()
 
+    def set_fps(self, fps: float) -> None:
+        self._timer.setInterval(max(1, int(round(1000 / max(1.0, float(fps))))))
+
     def toggle(self) -> None:
         if self.is_playing:
             self.stop()
@@ -104,9 +107,15 @@ class PreviewController(QObject):
         worker = self._audio_worker
         self._audio_worker = None
         if worker is not None:
-            worker.stop()
-            if worker.isRunning():
-                worker.wait(1000)
+            try:
+                worker.playback_error.disconnect(self._on_audio_error)
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                worker.finished.disconnect(self._on_audio_finished)
+            except (RuntimeError, TypeError):
+                pass
+            worker.stop(wait_ms=2000)
 
         if was_playing:
             self.playback_stopped.emit()

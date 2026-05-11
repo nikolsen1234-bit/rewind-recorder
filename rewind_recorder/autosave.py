@@ -72,7 +72,7 @@ class AutosaveManager:
 
         area = CaptureArea.normalized(**raw_area) if raw_area else None
 
-        self.project.fps = int(data.get("fps", DEFAULT_FPS))
+        self.project.fps = max(1, int(data.get("fps", DEFAULT_FPS) or DEFAULT_FPS))
         self.project.area = area
         self.project.temp_dir = Path(data["temp_dir"]) if data.get("temp_dir") else None
         self.project.frames = frame_paths

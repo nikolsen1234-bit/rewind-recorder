@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -5,6 +6,8 @@ import cv2
 import qtawesome as qta
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPixmap
+
+_log = logging.getLogger(__name__)
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -69,6 +72,7 @@ class MainWindow(QMainWindow):
         self.autosaver = AutosaveManager(self.project, self.audio)
 
         self.capture_worker: CaptureWorker | None = None
+        self._zombie_workers: list[CaptureWorker] = []
         self.selector: AreaSelector | None = None
         self.area_overlay = CaptureAreaOverlay()
         self.floating_control = FloatingRecorderControl()
@@ -98,7 +102,7 @@ class MainWindow(QMainWindow):
         if result.restored:
             self.audio.fps = self.project.fps
             self.exporter.fps = self.project.fps
-            self.preview_ctrl._timer.setInterval(max(1, int(round(1000 / self.project.fps))))
+            self.preview_ctrl.set_fps(self.project.fps)
             self.locked_capture_area = result.locked_area
             self._update_status("Restored previous recording")
             self._sync_overlay(apply_geometry=True)
@@ -516,12 +520,42 @@ class MainWindow(QMainWindow):
     def _stop_worker(self) -> None:
         worker = self.capture_worker
         if worker is None:
+            self._reap_zombie_workers()
             return
+
+        try:
+            worker.frame_saved.disconnect(self._on_frame_saved)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            worker.capture_error.disconnect(self._on_capture_error)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            worker.finished.disconnect(self._on_worker_finished)
+        except (RuntimeError, TypeError):
+            pass
+
         worker.stop()
         worker.wait(3000)
-        if worker.isRunning():
-            QMessageBox.warning(self, APP_NAME, "Recording thread did not stop within 3 seconds.")
         self.capture_worker = None
+
+        if worker.isRunning():
+            _log.warning("Capture thread did not stop within 3s; parking as zombie")
+            self._zombie_workers.append(worker)
+            worker.finished.connect(lambda w=worker: self._zombie_workers.remove(w) if w in self._zombie_workers else None)
+            QMessageBox.warning(
+                self, APP_NAME,
+                "Recording thread did not stop within 3 seconds. "
+                "It will keep running in the background until it exits cleanly.",
+            )
+
+        self._reap_zombie_workers()
+
+    def _reap_zombie_workers(self) -> None:
+        if not self._zombie_workers:
+            return
+        self._zombie_workers = [w for w in self._zombie_workers if w.isRunning()]
 
     def _on_worker_finished(self) -> None:
         if self.capture_worker is self.sender():
@@ -713,6 +747,17 @@ class MainWindow(QMainWindow):
             self._update_status("Import failed")
 
     def _save_as(self) -> None:
+        if self._state_transitioning:
+            return
+        self._state_transitioning = True
+        self.save_button.setEnabled(False)
+        try:
+            self._save_as_impl()
+        finally:
+            self._state_transitioning = False
+            self._update_controls()
+
+    def _save_as_impl(self) -> None:
         self.preview_ctrl.stop()
         if self.project.state is RecorderState.RECORDING:
             QMessageBox.warning(self, APP_NAME, "Pause or stop recording before saving.")
@@ -744,6 +789,7 @@ class MainWindow(QMainWindow):
                 output_path,
             )
         except Exception as exc:
+            _log.exception("Export failed")
             QMessageBox.critical(self, APP_NAME, f"Could not save recording:\n\n{exc}")
             self._update_status("Save failed")
             return
@@ -792,12 +838,16 @@ class MainWindow(QMainWindow):
         self.floating_control.set_state(self.project.state, True)
 
     def _maintain_topmost(self) -> None:
-        if self.area_overlay.isVisible():
-            force_widget_topmost(self.area_overlay)
-            exclude_widget_from_capture(self.area_overlay)
-        if self.floating_control.isVisible():
-            force_widget_topmost(self.floating_control)
-            exclude_widget_from_capture(self.floating_control)
+        try:
+            if self.area_overlay.isVisible():
+                force_widget_topmost(self.area_overlay)
+                exclude_widget_from_capture(self.area_overlay)
+            if self.floating_control.isVisible():
+                force_widget_topmost(self.floating_control)
+                exclude_widget_from_capture(self.floating_control)
+        except RuntimeError as exc:
+            _log.debug("Skipping topmost maintenance on deleted widget: %s", exc)
+            self.topmost_timer.stop()
 
     def _refresh_timeline(self) -> None:
         count = self.project.frame_count()
@@ -838,7 +888,11 @@ class MainWindow(QMainWindow):
             self.preview_label.setText("Preview unavailable")
             return
 
-        frame = cv2.imread(str(path))
+        try:
+            frame = cv2.imread(str(path))
+        except Exception as exc:
+            _log.warning("Preview cv2.imread raised on %s: %s", path, exc)
+            frame = None
         if frame is None:
             self._last_preview_frame = None
             self.preview_label.setPixmap(QPixmap())
@@ -929,9 +983,25 @@ class MainWindow(QMainWindow):
         self._scale_preview_to_label()
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        self.preview_ctrl.stop()
-        self._stop_worker()
-        self.audio.stop_recording(end_frame=self.project.frame_count())
+        self.topmost_timer.stop()
+
+        try:
+            self.preview_ctrl.stop()
+        except Exception:
+            _log.exception("preview stop failed during close")
+
+        try:
+            if self.project.state is RecorderState.RECORDING and self.capture_worker is not None:
+                self.capture_worker.stop()
+                self.capture_worker.wait(3000)
+        except Exception:
+            _log.exception("capture stop failed during close")
+
+        try:
+            self.audio.stop_recording(end_frame=self.project.frame_count())
+        except Exception:
+            _log.exception("audio stop failed during close")
+
         if self.project.state is RecorderState.RECORDING:
             self.project.state = RecorderState.PAUSED if self.project.has_frames() else RecorderState.IDLE
         self.project.set_timeline_index(self.project.frame_count())
@@ -942,6 +1012,8 @@ class MainWindow(QMainWindow):
             else:
                 self.autosaver.clear()
         except Exception as exc:
+            _log.exception("autosave failed during close")
+            self.topmost_timer.start()
             QMessageBox.critical(
                 self, APP_NAME,
                 f"Could not save the local recording project for restore.\n\n"
@@ -950,6 +1022,17 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
 
-        self.area_overlay.close()
-        self.floating_control.close()
+        try:
+            self._stop_worker()
+        except Exception:
+            _log.exception("_stop_worker failed during close")
+
+        try:
+            self.area_overlay.close()
+        except Exception:
+            pass
+        try:
+            self.floating_control.close()
+        except Exception:
+            pass
         event.accept()
