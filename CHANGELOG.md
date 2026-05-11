@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-11
+
+### Added
+
+- Real status bar at the bottom of the window. Status no longer hijacks the title bar.
+- Menu bar: **File** (Save As, Import Clip, Quit) and **Help** (Open Logs Folder, About).
+- About dialog showing version, log-file path, and the keyboard-shortcut cheat sheet.
+- Tooltips on every button, combo, and the timeline. Shortcuts shown inline in button labels.
+- Keyboard shortcuts: `F9` Record/Pause, `F10` Stop, `Space` Play preview, `[` Trim Start, `]` Trim End, `Ctrl+S` Save As, `Ctrl+Shift+L` open logs folder, `Ctrl+Q` Quit.
+- First-run guidance in the empty preview area: "Step 1 — Select Area", then "Step 2 — hit Record" once an area is locked in.
+
+### Changed
+
+- Record button is visually promoted (red accent, larger height) so the primary action stands out.
+- Time display is now a large monospace counter centred above the timeline, instead of a tiny grey label.
+- "Mark In / Mark Out / Delete Range / Clear Range" renamed to "Trim Start / Trim End / Cut Out Section / Clear Marks" — friendlier vocabulary.
+- "Input device / Output device" relabelled to "Microphone / System audio (loopback)" so the purpose is obvious.
+- Bottom toolbar regrouped into three sections: **Record** (Select Area / Record / Stop), **Trim** (cut out a section), **Review & save** (Play / Import / Save As).
+
 ## [0.1.2] - 2026-05-11
 
 ### Fixed
@@ -61,7 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Export as MP4.
 - Autosave while recording.
 
-[Unreleased]: https://github.com/nikolsen1234-bit/rewind-recorder/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/nikolsen1234-bit/rewind-recorder/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/nikolsen1234-bit/rewind-recorder/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/nikolsen1234-bit/rewind-recorder/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/nikolsen1234-bit/rewind-recorder/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/nikolsen1234-bit/rewind-recorder/releases/tag/v0.1.0
