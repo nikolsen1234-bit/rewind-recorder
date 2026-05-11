@@ -35,6 +35,10 @@ class AreaSelector(QWidget):
             geometry = geometry.united(screen.geometry())
         return geometry
 
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        exclude_widget_from_capture(self)
+
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(0, 0, 0, 90))

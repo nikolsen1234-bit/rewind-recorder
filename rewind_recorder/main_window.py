@@ -1163,6 +1163,10 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         self._scale_preview_to_label()
 
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        exclude_widget_from_capture(self)
+
     def closeEvent(self, event) -> None:  # noqa: N802
         self.topmost_timer.stop()
 
