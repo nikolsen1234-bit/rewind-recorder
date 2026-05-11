@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rewind-recorder"
-version = "0.1.1"
+version = "0.3.0"
 description = "Local Windows screen recorder with rewind-and-overwrite editing."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -45,3 +45,14 @@ rewind-recorder = "rewind_recorder.app:main"
 
 [tool.setuptools.packages.find]
 include = ["rewind_recorder*"]
+
+[tool.vulture]
+paths = ["rewind_recorder", ".vulture_whitelist.py"]
+min_confidence = 60
+
+[tool.deptry]
+known_first_party = ["rewind_recorder"]
+[tool.deptry.package_module_name_map]
+opencv-python = "cv2"
+PySide6 = "PySide6"
+imageio-ffmpeg = "imageio_ffmpeg"

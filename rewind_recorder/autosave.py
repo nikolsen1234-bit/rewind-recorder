@@ -1,11 +1,10 @@
 import json
-import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from rewind_recorder.audio_manager import AudioManager
 from rewind_recorder.config import AUTOSAVE_FILENAME, DEFAULT_FPS, RecorderState
+from rewind_recorder.paths import app_data_dir
 from rewind_recorder.project import FrameProject
 from rewind_recorder.types import AudioSegment, CaptureArea
 
@@ -72,7 +71,7 @@ class AutosaveManager:
 
         area = CaptureArea.normalized(**raw_area) if raw_area else None
 
-        self.project.fps = int(data.get("fps", DEFAULT_FPS))
+        self.project.fps = max(1, int(data.get("fps", DEFAULT_FPS) or DEFAULT_FPS))
         self.project.area = area
         self.project.temp_dir = Path(data["temp_dir"]) if data.get("temp_dir") else None
         self.project.frames = frame_paths
@@ -145,13 +144,5 @@ class AutosaveManager:
                 continue
         return highest + 1
 
-    @staticmethod
-    def _app_data_dir() -> Path:
-        if sys.platform == "win32":
-            base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-        else:
-            base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-        return base / "RewindRecorder"
-
     def _autosave_path(self) -> Path:
-        return self._app_data_dir() / AUTOSAVE_FILENAME
+        return app_data_dir() / AUTOSAVE_FILENAME

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 
 def format_seconds(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
     milliseconds = int(round((seconds - int(seconds)) * 1000))
     whole_seconds = int(seconds)
 

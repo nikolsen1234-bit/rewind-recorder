@@ -1,3 +1,4 @@
+import logging
 import shutil
 import subprocess
 import sys
@@ -9,8 +10,17 @@ import cv2
 import numpy as np
 
 from rewind_recorder.config import AUDIO_SAMPLE_RATE, DEFAULT_OUTPUT_HEIGHT, DEFAULT_OUTPUT_WIDTH
-from rewind_recorder.errors import VideoWriterOpenError
 from rewind_recorder.types import AudioSegment
+
+
+class VideoWriterOpenError(RuntimeError):
+    pass
+
+_log = logging.getLogger(__name__)
+_FFMPEG_TIMEOUT_SECONDS = 3600
+
+
+_UNRESOLVED = object()
 
 
 @dataclass(frozen=True)
@@ -22,9 +32,11 @@ class ExportResult:
 
 class VideoExporter:
     def __init__(self, fps: int) -> None:
-        self.fps = fps
+        self.fps = max(1, int(fps))
         self.output_width = DEFAULT_OUTPUT_WIDTH
         self.output_height = DEFAULT_OUTPUT_HEIGHT
+        self._ffmpeg_path: str | None | object = _UNRESOLVED
+        self._canvas: np.ndarray | None = None
 
     def export(
         self,
@@ -33,22 +45,27 @@ class VideoExporter:
         output_path: Path,
     ) -> ExportResult:
         video_path, used_fallback = self._render_video(frame_paths, output_path)
-        audio_path = self.build_audio_mix(
-            video_path.with_suffix(".wav"),
-            segments,
-            len(frame_paths),
-        )
-
-        if audio_path is None:
-            return ExportResult(path=video_path, used_fallback_codec=used_fallback, audio_muxed=False)
-
-        final_path, muxed, detail = self._mux_audio(video_path, audio_path)
-        if not muxed:
-            raise RuntimeError(
-                "This recording has audio, but the audio could not be embedded into the video.\n\n"
-                f"{detail}"
+        audio_path: Path | None = None
+        try:
+            audio_path = self.build_audio_mix(
+                video_path.with_suffix(".wav"),
+                segments,
+                len(frame_paths),
             )
-        return ExportResult(path=final_path, used_fallback_codec=used_fallback, audio_muxed=True)
+
+            if audio_path is None:
+                return ExportResult(path=video_path, used_fallback_codec=used_fallback, audio_muxed=False)
+
+            final_path, muxed, detail = self._mux_audio(video_path, audio_path)
+            if not muxed:
+                raise RuntimeError(
+                    "This recording has audio, but the audio could not be embedded into the video.\n\n"
+                    f"{detail}"
+                )
+            return ExportResult(path=final_path, used_fallback_codec=used_fallback, audio_muxed=True)
+        finally:
+            if audio_path is not None:
+                audio_path.unlink(missing_ok=True)
 
     def build_audio_mix(
         self,
@@ -120,11 +137,7 @@ class VideoExporter:
             str(output_path),
         ])
 
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        result = subprocess.run(
-            command, capture_output=True, text=True,
-            creationflags=creationflags, timeout=3600,
-        )
+        result = self._run_ffmpeg(command)
         if result.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
             output_path.unlink(missing_ok=True)
             detail = result.stderr.strip() or result.stdout.strip() or "FFmpeg did not create mixed audio."
@@ -136,22 +149,33 @@ class VideoExporter:
         if not frame_paths:
             raise RuntimeError("No frames are available.")
 
-        first_frame = cv2.imread(str(frame_paths[0]))
+        first_idx = 0
+        first_frame = None
+        for i, candidate in enumerate(frame_paths):
+            try:
+                first_frame = cv2.imread(str(candidate))
+            except Exception as exc:
+                _log.warning("cv2.imread raised on %s: %s", candidate, exc)
+                first_frame = None
+            if first_frame is not None:
+                first_idx = i
+                break
         if first_frame is None:
-            raise RuntimeError(f"Could not read first frame: {frame_paths[0]}")
+            raise RuntimeError("Could not read any recorded frame.")
 
+        usable_paths = frame_paths[first_idx:]
         height, width = first_frame.shape[:2]
         fps = float(self.fps)
 
         if requested_path.suffix.lower() == ".avi":
-            return self._write_video(requested_path, "XVID", frame_paths, fps, width, height), False
+            return self._write_video(requested_path, "XVID", usable_paths, fps, width, height), False
 
         mp4_path = requested_path.with_suffix(".mp4")
         try:
-            return self._write_video(mp4_path, "mp4v", frame_paths, fps, width, height), False
+            return self._write_video(mp4_path, "mp4v", usable_paths, fps, width, height), False
         except VideoWriterOpenError:
             avi_path = self._unique_path(requested_path.with_suffix(".avi"))
-            return self._write_video(avi_path, "XVID", frame_paths, fps, width, height), True
+            return self._write_video(avi_path, "XVID", usable_paths, fps, width, height), True
 
     def _write_video(
         self,
@@ -171,14 +195,26 @@ class VideoExporter:
             raise VideoWriterOpenError(f"OpenCV could not open a {codec} writer for {output_path}")
 
         completed = False
+        written = 0
+        skipped = 0
         try:
             for frame_path in frame_paths:
-                frame = cv2.imread(str(frame_path))
+                try:
+                    frame = cv2.imread(str(frame_path))
+                except Exception as exc:
+                    _log.warning("cv2.imread raised on %s: %s", frame_path, exc)
+                    frame = None
                 if frame is None:
-                    raise RuntimeError(f"Could not read frame: {frame_path}")
+                    skipped += 1
+                    continue
                 if frame.shape[1] != source_width or frame.shape[0] != source_height:
                     frame = cv2.resize(frame, (source_width, source_height), interpolation=cv2.INTER_AREA)
                 writer.write(self._frame_to_canvas(frame))
+                written += 1
+            if written == 0:
+                raise RuntimeError("No frames could be read for export.")
+            if skipped:
+                _log.warning("Export skipped %d unreadable frame(s) of %d", skipped, len(frame_paths))
             completed = True
         finally:
             writer.release()
@@ -201,7 +237,12 @@ class VideoExporter:
         scaled_h -= scaled_h % 2
 
         resized = cv2.resize(frame, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
-        canvas = np.zeros((self.output_height, self.output_width, 3), dtype=np.uint8)
+        canvas = self._canvas
+        if canvas is None or canvas.shape != (self.output_height, self.output_width, 3):
+            canvas = np.zeros((self.output_height, self.output_width, 3), dtype=np.uint8)
+            self._canvas = canvas
+        else:
+            canvas[:] = 0
         x = (self.output_width - scaled_w) // 2
         y = (self.output_height - scaled_h) // 2
         canvas[y : y + scaled_h, x : x + scaled_w] = resized
@@ -216,24 +257,16 @@ class VideoExporter:
         temp_output = final_path.with_name(f"{final_path.stem}_with_audio_tmp{final_path.suffix}")
         temp_output.unlink(missing_ok=True)
 
-        if video_path.suffix.lower() == ".mp4":
-            video_codec_args = ["-c:v", "copy"]
-        else:
-            video_codec_args = ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p"]
-
         command = [
             ffmpeg, "-y",
             "-i", str(video_path),
             "-i", str(audio_path),
-            *video_codec_args,
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
             "-c:a", "aac", "-b:a", "192k",
             str(temp_output),
         ]
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        result = subprocess.run(
-            command, capture_output=True, text=True,
-            creationflags=creationflags, timeout=3600,
-        )
+        result = self._run_ffmpeg(command)
         if result.returncode != 0 or not temp_output.exists() or temp_output.stat().st_size == 0:
             temp_output.unlink(missing_ok=True)
             detail = result.stderr.strip() or result.stdout.strip() or "FFmpeg did not create an output file."
@@ -243,10 +276,13 @@ class VideoExporter:
             final_path.unlink(missing_ok=True)
         if final_path == video_path:
             video_path.unlink(missing_ok=True)
-        temp_output.replace(final_path)
+        try:
+            temp_output.replace(final_path)
+        except OSError as exc:
+            temp_output.unlink(missing_ok=True)
+            return video_path, False, f"Could not move {temp_output.name} to {final_path}: {exc}"
         if video_path != final_path:
             video_path.unlink(missing_ok=True)
-        audio_path.unlink(missing_ok=True)
         return final_path, True, ""
 
     def _build_silent_audio(self, output_path: Path, duration_seconds: float) -> Path | None:
@@ -272,14 +308,47 @@ class VideoExporter:
         return output_path
 
     def _find_ffmpeg(self) -> str | None:
-        path = shutil.which("ffmpeg")
-        if path:
-            return path
+        if self._ffmpeg_path is not _UNRESOLVED:
+            return self._ffmpeg_path  # type: ignore[return-value]
+
         try:
-            import imageio_ffmpeg
-            return imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception:
-            return None
+            path = shutil.which("ffmpeg")
+        except Exception as exc:
+            _log.warning("shutil.which('ffmpeg') failed: %s", exc)
+            path = None
+
+        if not path:
+            try:
+                import imageio_ffmpeg
+                path = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception as exc:
+                _log.warning("imageio_ffmpeg lookup failed: %s", exc)
+                path = None
+
+        self._ffmpeg_path = path
+        if path is None:
+            _log.error("FFmpeg binary not found on PATH or via imageio_ffmpeg")
+        else:
+            _log.info("Using FFmpeg at %s", path)
+        return path
+
+    def _run_ffmpeg(self, command: list[str]) -> subprocess.CompletedProcess:
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        try:
+            return subprocess.run(
+                command, capture_output=True, text=True,
+                creationflags=creationflags, timeout=_FFMPEG_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stderr = (exc.stderr or "").strip() if isinstance(exc.stderr, str) else ""
+            stdout = (exc.stdout or "").strip() if isinstance(exc.stdout, str) else ""
+            detail = stderr or stdout or "no output captured"
+            raise RuntimeError(
+                f"FFmpeg did not finish within {_FFMPEG_TIMEOUT_SECONDS}s and was terminated. {detail}"
+            ) from exc
+        except FileNotFoundError as exc:
+            self._ffmpeg_path = _UNRESOLVED
+            raise RuntimeError(f"FFmpeg executable disappeared: {exc}") from exc
 
     def _unique_path(self, path: Path) -> Path:
         if not path.exists():

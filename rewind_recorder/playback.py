@@ -1,9 +1,13 @@
+import logging
 import threading
 import wave
 from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QThread, Signal
+
+_log = logging.getLogger(__name__)
+_PLAYBACK_CHUNK_FRAMES = 1024
 
 
 class AudioPlaybackWorker(QThread):
@@ -16,8 +20,11 @@ class AudioPlaybackWorker(QThread):
         self.speaker_id = speaker_id
         self._stop_event = threading.Event()
 
-    def stop(self) -> None:
+    def stop(self, *, wait_ms: int = 2000) -> None:
         self._stop_event.set()
+        if self.isRunning():
+            if not self.wait(wait_ms):
+                _log.warning("AudioPlaybackWorker did not stop within %d ms", wait_ms)
 
     def run(self) -> None:
         try:
@@ -35,7 +42,7 @@ class AudioPlaybackWorker(QThread):
 
                 with speaker.player(samplerate=sample_rate, channels=channels) as player:
                     while not self._stop_event.is_set():
-                        data = reader.readframes(2048)
+                        data = reader.readframes(_PLAYBACK_CHUNK_FRAMES)
                         if not data:
                             break
                         samples = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
@@ -45,6 +52,7 @@ class AudioPlaybackWorker(QThread):
                             samples = samples.reshape(-1, 1)
                         player.play(samples)
         except Exception as exc:
+            _log.exception("Audio playback worker failed")
             self.playback_error.emit(str(exc))
 
     def _find_speaker(self, sc) -> object:

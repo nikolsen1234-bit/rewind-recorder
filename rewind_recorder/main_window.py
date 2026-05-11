@@ -1,10 +1,15 @@
+import contextlib
+import logging
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 import cv2
 import qtawesome as qta
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QImage, QPixmap
+from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -15,11 +20,19 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QStatusBar,
     QVBoxLayout,
     QWidget,
 )
 
+_log = logging.getLogger(__name__)
+_IMPORT_FRAME_CAP = 36_000
+
+from rewind_recorder import __version__
 from rewind_recorder.audio_manager import AudioManager
+from rewind_recorder.paths import log_dir, log_path
+from rewind_recorder.qtutil import safe_disconnect
+from rewind_recorder.workers import ExportWorker, ImportClipWorker
 from rewind_recorder.autosave import AutosaveManager
 from rewind_recorder.capture import CaptureWorker
 from rewind_recorder.config import APP_NAME, DEFAULT_FPS, RecorderState
@@ -56,8 +69,39 @@ QPushButton:disabled {
 }
 """
 
+_PRIMARY_BUTTON_STYLE = """
+QPushButton {
+    background: #b8302d;
+    color: #ffffff;
+    border: 1px solid #d04040;
+    border-radius: 6px;
+    padding: 10px 16px;
+    font-size: 14px;
+    font-weight: 700;
+}
+QPushButton:hover {
+    background: #c93a37;
+    border-color: #e25555;
+}
+QPushButton:pressed {
+    background: #8f2522;
+    border-color: #a02d2a;
+}
+QPushButton:disabled {
+    background: #3a1c1c;
+    color: #7a5757;
+    border-color: #4a2424;
+}
+"""
+
 _SECTION_STYLE = "font-weight: 700; font-size: 14px; color: #ccc;"
 _SUBLABEL_STYLE = "color: #888; font-size: 12px;"
+_TIME_STYLE = (
+    "font-family: 'Consolas', 'Cascadia Mono', 'Courier New', monospace; "
+    "font-size: 22px; font-weight: 600; color: #e8e8e8; "
+    "padding: 4px 12px; background: #0e0e0e; border: 1px solid #2a2a2a; "
+    "border-radius: 6px; letter-spacing: 1px;"
+)
 
 
 class MainWindow(QMainWindow):
@@ -69,6 +113,9 @@ class MainWindow(QMainWindow):
         self.autosaver = AutosaveManager(self.project, self.audio)
 
         self.capture_worker: CaptureWorker | None = None
+        self._zombie_workers: list[CaptureWorker] = []
+        self._import_worker: ImportClipWorker | None = None
+        self._export_worker: ExportWorker | None = None
         self.selector: AreaSelector | None = None
         self.area_overlay = CaptureAreaOverlay()
         self.floating_control = FloatingRecorderControl()
@@ -98,7 +145,7 @@ class MainWindow(QMainWindow):
         if result.restored:
             self.audio.fps = self.project.fps
             self.exporter.fps = self.project.fps
-            self.preview_ctrl._timer.setInterval(max(1, int(round(1000 / self.project.fps))))
+            self.preview_ctrl.set_fps(self.project.fps)
             self.locked_capture_area = result.locked_area
             self._update_status("Restored previous recording")
             self._sync_overlay(apply_geometry=True)
@@ -111,10 +158,12 @@ class MainWindow(QMainWindow):
         self._refresh_timeline()
         self._update_controls()
 
-    def _icon(self, name: str) -> "QIcon":
+    def _icon(self, name: str):
         return qta.icon(name, color=QColor(200, 200, 200))
 
     def _build_ui(self) -> None:
+        self._build_menu_bar()
+
         central = QWidget()
         central.setStyleSheet("background: #181818;")
         layout = QVBoxLayout(central)
@@ -122,54 +171,89 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 12, 16, 12)
 
         self.time_label = QLabel("00:00.000 / 00:00.000")
-        self.time_label.setStyleSheet(_SUBLABEL_STYLE)
+        self.time_label.setStyleSheet(_TIME_STYLE)
         self.time_label.setAlignment(Qt.AlignCenter)
-        self.cut_label = QLabel("Trim range: none")
+        self.time_label.setToolTip("Current position / total recording length")
+
+        self.cut_label = QLabel("Trim: none")
         self.cut_label.setStyleSheet(_SUBLABEL_STYLE)
 
-        self.preview_label = QLabel("Preview appears here after frames are recorded")
+        self.preview_label = QLabel(self._preview_hint_text())
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumSize(320, 180)
         self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.preview_label.setScaledContents(False)
+        self.preview_label.setWordWrap(True)
         self.preview_label.setStyleSheet(
-            "QLabel { background: #0a0a0a; color: #666; border: 1px solid #333; border-radius: 6px; }"
+            "QLabel { background: #0a0a0a; color: #888; border: 1px solid #333; "
+            "border-radius: 6px; font-size: 14px; padding: 24px; }"
         )
         self._last_preview_frame: QImage | None = None
 
         self.timeline = TrimTimeline()
         self.timeline.setRange(0, 0)
         self.timeline.setEnabled(False)
+        self.timeline.setToolTip(
+            "Drag to scrub. While paused, click Record to overwrite from this point."
+        )
         self.timeline.valueChanged.connect(self._on_timeline_changed)
         self.timeline.selectionChanged.connect(self._on_trim_selection_changed)
         self.timeline.sliderPressed.connect(self._on_timeline_pressed)
         self.timeline.sliderReleased.connect(self._on_timeline_released)
 
         self.audio_input_combo = QComboBox()
+        self.audio_input_combo.setToolTip("Microphone used while recording (WASAPI). Pick \"none\" by leaving empty.")
         self.audio_output_combo = QComboBox()
+        self.audio_output_combo.setToolTip("System audio source (loopback) — captures whatever your speakers play.")
         self.refresh_audio_button = QPushButton(self._icon("mdi6.refresh"), " Refresh")
         self.refresh_audio_button.setStyleSheet(_BUTTON_STYLE)
+        self.refresh_audio_button.setToolTip("Re-scan audio devices (after plugging in a mic, etc.)")
         self.refresh_audio_button.clicked.connect(self._refresh_audio_devices)
 
         self.select_button = QPushButton(self._icon("mdi6.target"), " Select Area")
-        self.record_button = QPushButton(self._icon("mdi6.record-circle-outline"), " Record")
-        self.import_button = QPushButton(self._icon("mdi6.file-import-outline"), " Import")
-        self.play_preview_button = QPushButton(self._icon("mdi6.play"), " Play")
-        self.stop_button = QPushButton(self._icon("mdi6.stop"), " Stop")
-        self.save_button = QPushButton(self._icon("mdi6.content-save"), " Save")
-        self.cut_start_button = QPushButton(self._icon("mdi6.format-vertical-align-top"), " Mark In")
-        self.cut_end_button = QPushButton(self._icon("mdi6.format-vertical-align-bottom"), " Mark Out")
-        self.delete_cut_button = QPushButton(self._icon("mdi6.delete-outline"), " Delete Range")
-        self.clear_cut_button = QPushButton(self._icon("mdi6.close-circle-outline"), " Clear Range")
+        self.select_button.setToolTip("Drag a box around the part of the screen you want to capture.")
+
+        self.record_button = QPushButton(self._icon("mdi6.record-circle-outline"), " Record  (F9)")
+        self.record_button.setToolTip(
+            "Start recording. While recording, click again (or press F9) to pause.\n"
+            "While paused, scrub the timeline back and click Record to overwrite from there."
+        )
+
+        self.import_button = QPushButton(self._icon("mdi6.file-import-outline"), " Import Clip")
+        self.import_button.setToolTip("Load an existing video file (mp4/avi/mov/mkv/webm) into the editor.")
+
+        self.play_preview_button = QPushButton(self._icon("mdi6.play"), " Play  (Space)")
+        self.play_preview_button.setToolTip("Preview the recording with audio. Press Space to toggle.")
+
+        self.stop_button = QPushButton(self._icon("mdi6.stop"), " Stop  (F10)")
+        self.stop_button.setToolTip("Stop the current recording session and finalize it.")
+
+        self.save_button = QPushButton(self._icon("mdi6.content-save"), " Save As...  (Ctrl+S)")
+        self.save_button.setToolTip("Export the recording to MP4 with embedded audio.")
+
+        self.cut_start_button = QPushButton(self._icon("mdi6.format-vertical-align-top"), " Trim Start  ([)")
+        self.cut_start_button.setToolTip("Set the start of a section to cut out, at the current playhead.")
+
+        self.cut_end_button = QPushButton(self._icon("mdi6.format-vertical-align-bottom"), " Trim End  (])")
+        self.cut_end_button.setToolTip("Set the end of a section to cut out, at the current playhead.")
+
+        self.delete_cut_button = QPushButton(self._icon("mdi6.delete-outline"), " Cut Out Section")
+        self.delete_cut_button.setToolTip("Permanently remove the marked section from the recording.")
+
+        self.clear_cut_button = QPushButton(self._icon("mdi6.close-circle-outline"), " Clear Marks")
+        self.clear_cut_button.setToolTip("Forget the current trim start/end marks (does not delete frames).")
 
         for btn in (
-            self.select_button, self.record_button, self.import_button,
+            self.select_button, self.import_button,
             self.play_preview_button, self.stop_button, self.save_button,
             self.cut_start_button, self.cut_end_button,
             self.delete_cut_button, self.clear_cut_button,
         ):
             btn.setMinimumHeight(40)
             btn.setStyleSheet(_BUTTON_STYLE)
+
+        self.record_button.setMinimumHeight(46)
+        self.record_button.setStyleSheet(_PRIMARY_BUTTON_STYLE)
 
         self.select_button.clicked.connect(self._select_area)
         self.record_button.clicked.connect(self._record_or_resume)
@@ -185,14 +269,14 @@ class MainWindow(QMainWindow):
 
         input_col = QVBoxLayout()
         input_col.setSpacing(4)
-        input_title = QLabel("Input device")
+        input_title = QLabel("Microphone")
         input_title.setStyleSheet(_SECTION_STYLE)
         input_col.addWidget(input_title)
         input_col.addWidget(self.audio_input_combo)
 
         output_col = QVBoxLayout()
         output_col.setSpacing(4)
-        output_title = QLabel("Output device")
+        output_title = QLabel("System audio (loopback)")
         output_title.setStyleSheet(_SECTION_STYLE)
         output_col.addWidget(output_title)
         output_col.addWidget(self.audio_output_combo)
@@ -207,22 +291,24 @@ class MainWindow(QMainWindow):
         audio_row.addLayout(output_col, 1)
         audio_row.addLayout(refresh_col)
 
+        time_row = QHBoxLayout()
+        time_row.addStretch(1)
+        time_row.addWidget(self.time_label)
+        time_row.addStretch(1)
+
         timeline_header = QHBoxLayout()
         tl_label = QLabel("Timeline")
         tl_label.setStyleSheet(_SECTION_STYLE)
         timeline_header.addWidget(tl_label)
+        timeline_header.addSpacing(12)
+        timeline_header.addWidget(self.cut_label)
         timeline_header.addStretch(1)
 
         trim_col = QVBoxLayout()
         trim_col.setSpacing(6)
-        trim_header = QHBoxLayout()
-        trim_title = QLabel("Trim")
+        trim_title = QLabel("Trim (cut out a section)")
         trim_title.setStyleSheet(_SECTION_STYLE)
-        trim_header.addWidget(trim_title)
-        trim_header.addSpacing(10)
-        trim_header.addWidget(self.cut_label)
-        trim_header.addStretch(1)
-        trim_col.addLayout(trim_header)
+        trim_col.addWidget(trim_title)
         trim_btns = QHBoxLayout()
         trim_btns.setSpacing(6)
         trim_btns.addWidget(self.cut_start_button)
@@ -231,46 +317,139 @@ class MainWindow(QMainWindow):
         trim_btns.addWidget(self.clear_cut_button)
         trim_col.addLayout(trim_btns)
 
-        playback_col = QVBoxLayout()
-        playback_col.setSpacing(6)
-        pb_title = QLabel("Playback")
-        pb_title.setStyleSheet(_SECTION_STYLE)
-        playback_col.addWidget(pb_title)
-        pb_btns = QHBoxLayout()
-        pb_btns.setSpacing(6)
-        pb_btns.addWidget(self.select_button)
-        pb_btns.addWidget(self.record_button)
-        pb_btns.addWidget(self.play_preview_button)
-        pb_btns.addWidget(self.stop_button)
-        playback_col.addLayout(pb_btns)
+        record_col = QVBoxLayout()
+        record_col.setSpacing(6)
+        rc_title = QLabel("Record")
+        rc_title.setStyleSheet(_SECTION_STYLE)
+        record_col.addWidget(rc_title)
+        rc_btns = QHBoxLayout()
+        rc_btns.setSpacing(6)
+        rc_btns.addWidget(self.select_button)
+        rc_btns.addWidget(self.record_button, 1)
+        rc_btns.addWidget(self.stop_button)
+        record_col.addLayout(rc_btns)
 
-        actions_col = QVBoxLayout()
-        actions_col.setSpacing(6)
-        act_title = QLabel("Actions")
-        act_title.setStyleSheet(_SECTION_STYLE)
-        actions_col.addWidget(act_title)
-        act_btns = QHBoxLayout()
-        act_btns.setSpacing(6)
-        act_btns.addWidget(self.import_button)
-        act_btns.addWidget(self.save_button)
-        actions_col.addLayout(act_btns)
+        review_col = QVBoxLayout()
+        review_col.setSpacing(6)
+        rv_title = QLabel("Review & save")
+        rv_title.setStyleSheet(_SECTION_STYLE)
+        review_col.addWidget(rv_title)
+        rv_btns = QHBoxLayout()
+        rv_btns.setSpacing(6)
+        rv_btns.addWidget(self.play_preview_button)
+        rv_btns.addWidget(self.import_button)
+        rv_btns.addWidget(self.save_button)
+        review_col.addLayout(rv_btns)
 
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(24)
+        bottom_row.addLayout(record_col, 2)
         bottom_row.addLayout(trim_col, 2)
-        bottom_row.addLayout(playback_col, 1)
-        bottom_row.addLayout(actions_col, 1)
+        bottom_row.addLayout(review_col, 2)
 
         layout.addLayout(audio_row)
         layout.addWidget(self.preview_label, 1)
+        layout.addLayout(time_row)
         layout.addLayout(timeline_header)
         layout.addWidget(self.timeline)
-        layout.addWidget(self.time_label)
         layout.addSpacing(8)
         layout.addLayout(bottom_row)
 
         self.setCentralWidget(central)
+
+        self._build_status_bar()
+        self._install_shortcuts()
         self._refresh_audio_devices()
+
+    def _build_menu_bar(self) -> None:
+        menu = self.menuBar()
+        file_menu = menu.addMenu("&File")
+        save_action = QAction("&Save As...", self)
+        save_action.setShortcut(QKeySequence("Ctrl+S"))
+        save_action.triggered.connect(self._save_as)
+        file_menu.addAction(save_action)
+        import_action = QAction("&Import Clip...", self)
+        import_action.triggered.connect(self._import_clip)
+        file_menu.addAction(import_action)
+        file_menu.addSeparator()
+        quit_action = QAction("&Quit", self)
+        quit_action.setShortcut(QKeySequence("Ctrl+Q"))
+        quit_action.triggered.connect(self.close)
+        file_menu.addAction(quit_action)
+
+        help_menu = menu.addMenu("&Help")
+        logs_action = QAction("Open &Logs Folder", self)
+        logs_action.setShortcut(QKeySequence("Ctrl+Shift+L"))
+        logs_action.triggered.connect(self._open_logs_folder)
+        help_menu.addAction(logs_action)
+        help_menu.addSeparator()
+        about_action = QAction("&About Rewind Recorder", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
+
+    def _build_status_bar(self) -> None:
+        self.status_bar = QStatusBar(self)
+        self.status_bar.setStyleSheet(
+            "QStatusBar { background: #141414; color: #bbb; border-top: 1px solid #2a2a2a; } "
+            "QStatusBar::item { border: none; }"
+        )
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage("Ready — pick a screen area to start.")
+
+    def _install_shortcuts(self) -> None:
+        for key, slot in (
+            ("F9", self._record_or_resume),
+            ("F10", self._stop_recording),
+            ("Space", self._toggle_preview),
+            ("[", self._set_cut_start),
+            ("]", self._set_cut_end),
+        ):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.activated.connect(slot)
+
+    def _preview_hint_text(self) -> str:
+        if self.project.area is None:
+            return (
+                "Step 1 — click \"Select Area\" to drag a box around what you want to record.\n\n"
+                "Then hit Record (F9). Pause anytime, scrub the timeline back, and Record\n"
+                "again to overwrite. Use Trim Start/End to cut out a section, then Save As."
+            )
+        if not self.project.has_frames():
+            return (
+                f"Area locked: {self.project.area.width}×{self.project.area.height}\n\n"
+                "Step 2 — hit Record (F9) to start capturing.\n"
+                "Press F9 again to pause. F10 to stop. Space to preview."
+            )
+        return "Preview unavailable"
+
+    def _open_logs_folder(self) -> None:
+        target = log_dir()
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(str(target))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+        except Exception as exc:
+            _log.exception("Could not open logs folder")
+            QMessageBox.warning(self, APP_NAME, f"Could not open logs folder:\n{target}\n\n{exc}")
+
+    def _show_about(self) -> None:
+        QMessageBox.about(
+            self, f"About {APP_NAME}",
+            f"<h3>{APP_NAME}</h3>"
+            f"<p>Version {__version__}</p>"
+            f"<p>Local Windows screen recorder with rewind-and-overwrite editing. "
+            f"Nothing leaves your machine.</p>"
+            f"<p><b>Logs:</b><br><code>{log_path()}</code></p>"
+            f"<p><a href=\"https://github.com/nikolsen1234-bit/rewind-recorder\">"
+            f"github.com/nikolsen1234-bit/rewind-recorder</a></p>"
+            f"<p><b>Shortcuts</b><br>"
+            f"F9 Record / Pause &nbsp; F10 Stop &nbsp; Space Play preview<br>"
+            f"[ Trim Start &nbsp; ] Trim End &nbsp; Ctrl+S Save As &nbsp; Ctrl+Q Quit</p>"
+        )
 
     def _refresh_audio_devices(self) -> None:
         prev_input = self.audio_input_combo.currentData()
@@ -396,20 +575,27 @@ class MainWindow(QMainWindow):
         else:
             self._start_recording()
 
-    def _with_transition(self, expected: RecorderState, action: callable) -> None:
-        if self.project.state is not expected:
-            return
-        self.preview_ctrl.stop()
+    @contextlib.contextmanager
+    def _transitioning(self):
         if self._state_transitioning:
+            yield False
             return
         self._state_transitioning = True
         self._update_controls()
         QApplication.processEvents()
         try:
-            action()
+            yield True
         finally:
             self._state_transitioning = False
             self._update_controls()
+
+    def _with_transition(self, expected: RecorderState, action: callable) -> None:
+        if self.project.state is not expected:
+            return
+        self.preview_ctrl.stop()
+        with self._transitioning() as entered:
+            if entered:
+                action()
 
     def _start_recording(self) -> None:
         if self.project.area is None:
@@ -417,12 +603,9 @@ class MainWindow(QMainWindow):
             return
         if self.project.state is RecorderState.RECORDING:
             return
-        if self._state_transitioning:
-            return
-        self._state_transitioning = True
-        self._update_controls()
-        QApplication.processEvents()
-        try:
+        with self._transitioning() as entered:
+            if not entered:
+                return
             if self.project.has_frames():
                 reply = QMessageBox.question(
                     self, APP_NAME,
@@ -439,9 +622,6 @@ class MainWindow(QMainWindow):
             self.project.set_timeline_index(0)
             self.project.reset_cut_marks()
             self._begin_capture()
-        finally:
-            self._state_transitioning = False
-            self._update_controls()
 
     def _pause_recording(self) -> None:
         def action():
@@ -516,12 +696,33 @@ class MainWindow(QMainWindow):
     def _stop_worker(self) -> None:
         worker = self.capture_worker
         if worker is None:
+            self._reap_zombie_workers()
             return
+
+        safe_disconnect(worker.frame_saved, self._on_frame_saved)
+        safe_disconnect(worker.capture_error, self._on_capture_error)
+        safe_disconnect(worker.finished, self._on_worker_finished)
+
         worker.stop()
         worker.wait(3000)
-        if worker.isRunning():
-            QMessageBox.warning(self, APP_NAME, "Recording thread did not stop within 3 seconds.")
         self.capture_worker = None
+
+        if worker.isRunning():
+            _log.warning("Capture thread did not stop within 3s; parking as zombie")
+            self._zombie_workers.append(worker)
+            worker.finished.connect(lambda w=worker: self._zombie_workers.remove(w) if w in self._zombie_workers else None)
+            QMessageBox.warning(
+                self, APP_NAME,
+                "Recording thread did not stop within 3 seconds. "
+                "It will keep running in the background until it exits cleanly.",
+            )
+
+        self._reap_zombie_workers()
+
+    def _reap_zombie_workers(self) -> None:
+        if not self._zombie_workers:
+            return
+        self._zombie_workers = [w for w in self._zombie_workers if w.isRunning()]
 
     def _on_worker_finished(self) -> None:
         if self.capture_worker is self.sender():
@@ -582,52 +783,52 @@ class MainWindow(QMainWindow):
 
     def _set_cut_start(self) -> None:
         if self.project.state is RecorderState.RECORDING:
-            QMessageBox.warning(self, APP_NAME, "Pause or stop recording before setting Mark In.")
+            QMessageBox.warning(self, APP_NAME, "Pause or stop recording before setting a trim start.")
             return
         if not self.project.has_frames():
-            QMessageBox.warning(self, APP_NAME, "Record frames before setting Mark In.")
+            QMessageBox.warning(self, APP_NAME, "Record some frames before setting a trim start.")
             return
         self.project.cut_start = self.timeline.value()
         self._refresh_timeline()
-        self._update_status(f"Mark In set at {format_seconds(self.project.cut_start / self.project.fps)}")
+        self._update_status(f"Trim start at {format_seconds(self.project.cut_start / self.project.fps)}")
         self._update_controls()
 
     def _set_cut_end(self) -> None:
         if self.project.state is RecorderState.RECORDING:
-            QMessageBox.warning(self, APP_NAME, "Pause or stop recording before setting Mark Out.")
+            QMessageBox.warning(self, APP_NAME, "Pause or stop recording before setting a trim end.")
             return
         if not self.project.has_frames():
-            QMessageBox.warning(self, APP_NAME, "Record frames before setting Mark Out.")
+            QMessageBox.warning(self, APP_NAME, "Record some frames before setting a trim end.")
             return
         self.project.cut_end = self.timeline.value()
         self._refresh_timeline()
-        self._update_status(f"Mark Out set at {format_seconds(self.project.cut_end / self.project.fps)}")
+        self._update_status(f"Trim end at {format_seconds(self.project.cut_end / self.project.fps)}")
         self._update_controls()
 
     def _clear_cut_selection(self) -> None:
         self.project.reset_cut_marks()
         self._refresh_timeline()
-        self._update_status("Trim range cleared")
+        self._update_status("Trim marks cleared")
         self._update_controls()
 
     def _delete_selected_range(self) -> None:
         if self.project.state is RecorderState.RECORDING:
-            QMessageBox.warning(self, APP_NAME, "Pause or stop recording before deleting a trim range.")
+            QMessageBox.warning(self, APP_NAME, "Pause or stop recording before cutting out a section.")
             return
         if self.project.cut_start is None or self.project.cut_end is None:
-            QMessageBox.warning(self, APP_NAME, "Set both Mark In and Mark Out before deleting the trim range.")
+            QMessageBox.warning(self, APP_NAME, "Set both Trim Start and Trim End before cutting out a section.")
             return
 
         start, end = self.project.cut_start, self.project.cut_end
         if start == end:
-            QMessageBox.warning(self, APP_NAME, "Mark In and Mark Out are the same position, so nothing is selected.")
+            QMessageBox.warning(self, APP_NAME, "Trim Start and Trim End are the same position, so nothing is selected.")
             return
 
         lo, hi = sorted((start, end))
         duration = (hi - lo) / self.project.fps
         reply = QMessageBox.question(
             self, APP_NAME,
-            f"Delete the marked trim range?\n\n"
+            f"Cut out this section?\n\n"
             f"{format_seconds(lo / self.project.fps)} to "
             f"{format_seconds(hi / self.project.fps)} "
             f"({format_seconds(duration)})",
@@ -639,7 +840,7 @@ class MainWindow(QMainWindow):
         self.audio.delete_range(start, end)
         removed = self.project.delete_range(start, end)
         self._refresh_timeline()
-        self._update_status(f"Deleted trim range ({removed} frame(s))")
+        self._update_status(f"Cut out section ({removed} frame(s))")
         self._update_controls()
 
     def _toggle_preview(self) -> None:
@@ -662,7 +863,7 @@ class MainWindow(QMainWindow):
 
     def _on_preview_stopped(self) -> None:
         self.play_preview_button.setIcon(self._icon("mdi6.play"))
-        self.play_preview_button.setText(" Play")
+        self.play_preview_button.setText(" Play  (Space)")
         state = self.project.state
         self._update_status("Paused" if state is RecorderState.PAUSED else state.value.title())
         self._update_controls()
@@ -672,6 +873,8 @@ class MainWindow(QMainWindow):
         if self.project.state is RecorderState.RECORDING:
             QMessageBox.warning(self, APP_NAME, "Pause or stop recording before importing.")
             return
+        if self._import_worker is not None or self._export_worker is not None:
+            return
 
         filename, _ = QFileDialog.getOpenFileName(
             self, "Import Video Clip", str(Path.home() / "Videos"),
@@ -680,37 +883,56 @@ class MainWindow(QMainWindow):
         if not filename:
             return
 
-        self._update_status("Importing...")
-        QApplication.processEvents()
+        clip_path = Path(filename)
+        worker = ImportClipWorker(self.project, clip_path, _IMPORT_FRAME_CAP)
+        worker.progress.connect(self._on_import_progress)
+        worker.finished_ok.connect(self._on_import_finished)
+        worker.failed.connect(self._on_import_failed)
+        worker.finished.connect(lambda w=worker: self._reap_finished_thread(w, "_import_worker"))
 
-        try:
-            cap = cv2.VideoCapture(filename)
-            if not cap.isOpened():
-                raise RuntimeError(f"Could not open video file: {filename}")
+        self._import_worker = worker
+        self._state_transitioning = True
+        self._update_status(f"Importing {clip_path.name}…")
+        self._update_controls()
+        worker.start()
 
-            imported = 0
-            while True:
-                ok, frame = cap.read()
-                if not ok:
-                    break
-                self.project.add_frame(frame)
-                imported += 1
+    def _on_import_progress(self, done: int, total: int) -> None:
+        if total > 0:
+            self._update_status(f"Importing… {done}/{total} frames")
+        else:
+            self._update_status(f"Importing… {done} frames")
 
-            cap.release()
-
-            if imported == 0:
-                QMessageBox.warning(self, APP_NAME, "No frames could be read from the selected video.")
-                return
-
-            if self.project.state is RecorderState.IDLE:
-                self.project.state = RecorderState.PAUSED
-            self.project.set_timeline_index(self.project.frame_count())
-            self._refresh_timeline()
-            self._update_status(f"Imported {imported} frames from {Path(filename).name}")
-            self._update_controls()
-        except Exception as exc:
-            QMessageBox.critical(self, APP_NAME, f"Could not import video:\n\n{exc}")
+    def _on_import_finished(self, imported: int, source_fps: float) -> None:
+        if imported == 0:
+            QMessageBox.warning(self, APP_NAME, "No frames could be read from the selected video.")
             self._update_status("Import failed")
+            return
+
+        if self.project.state is RecorderState.IDLE:
+            self.project.state = RecorderState.PAUSED
+        self.project.set_timeline_index(self.project.frame_count())
+        self._refresh_timeline()
+
+        msg = f"Imported {imported} frames"
+        if imported >= _IMPORT_FRAME_CAP:
+            msg += f" (capped at {_IMPORT_FRAME_CAP} — clip was longer)"
+        self._update_status(msg)
+        if source_fps > 0 and abs(source_fps - self.project.fps) > 0.5:
+            QMessageBox.warning(
+                self, APP_NAME,
+                f"Imported clip is {source_fps:.2f} fps but project is {self.project.fps} fps. "
+                f"Playback and export will use the project rate, so timing may not match the source.",
+            )
+
+    def _on_import_failed(self, message: str) -> None:
+        QMessageBox.critical(self, APP_NAME, f"Could not import video:\n\n{message}")
+        self._update_status("Import failed")
+
+    def _reap_finished_thread(self, worker, attr: str) -> None:
+        if getattr(self, attr, None) is worker:
+            setattr(self, attr, None)
+        self._state_transitioning = False
+        self._update_controls()
 
     def _save_as(self) -> None:
         self.preview_ctrl.stop()
@@ -719,6 +941,8 @@ class MainWindow(QMainWindow):
             return
         if not self.project.has_frames():
             QMessageBox.warning(self, APP_NAME, "There are no recorded frames to save.")
+            return
+        if self._import_worker is not None or self._export_worker is not None:
             return
 
         default_dir = Path.home() / "Videos"
@@ -735,25 +959,29 @@ class MainWindow(QMainWindow):
         if output_path.suffix.lower() != ".mp4":
             output_path = output_path.with_suffix(".mp4")
 
-        try:
-            self._update_status("Saving...")
-            QApplication.processEvents()
-            result = self.exporter.export(
-                self.project.snapshot_frame_paths(),
-                self.audio.mix_segments(),
-                output_path,
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, APP_NAME, f"Could not save recording:\n\n{exc}")
-            self._update_status("Save failed")
-            return
+        worker = ExportWorker(
+            self.exporter,
+            self.project.snapshot_frame_paths(),
+            self.audio.mix_segments(),
+            output_path,
+        )
+        worker.progress.connect(self._update_status)
+        worker.finished_ok.connect(self._on_export_finished)
+        worker.failed.connect(self._on_export_failed)
+        worker.finished.connect(lambda w=worker: self._reap_finished_thread(w, "_export_worker"))
 
+        self._export_worker = worker
+        self._state_transitioning = True
+        self._update_status("Saving…")
+        self._update_controls()
+        worker.start()
+
+    def _on_export_finished(self, result) -> None:
         self.audio.clear(delete_files=True)
         self.project.clear_frames()
         self.autosaver.clear()
         self.project.state = RecorderState.IDLE
         self._refresh_timeline()
-        self._update_controls()
         self.area_overlay.hide()
         self.floating_control.hide()
 
@@ -771,6 +999,11 @@ class MainWindow(QMainWindow):
             msg += "\n\n" + "\n\n".join(notes)
         QMessageBox.information(self, APP_NAME, msg)
         self._update_status("Saved")
+
+    def _on_export_failed(self, message: str) -> None:
+        _log.error("Export failed: %s", message)
+        QMessageBox.critical(self, APP_NAME, f"Could not save recording:\n\n{message}")
+        self._update_status("Save failed")
 
     def _sync_overlay(self, apply_geometry: bool = False) -> None:
         if self.project.area is None:
@@ -792,12 +1025,16 @@ class MainWindow(QMainWindow):
         self.floating_control.set_state(self.project.state, True)
 
     def _maintain_topmost(self) -> None:
-        if self.area_overlay.isVisible():
-            force_widget_topmost(self.area_overlay)
-            exclude_widget_from_capture(self.area_overlay)
-        if self.floating_control.isVisible():
-            force_widget_topmost(self.floating_control)
-            exclude_widget_from_capture(self.floating_control)
+        try:
+            if self.area_overlay.isVisible():
+                force_widget_topmost(self.area_overlay)
+                exclude_widget_from_capture(self.area_overlay)
+            if self.floating_control.isVisible():
+                force_widget_topmost(self.floating_control)
+                exclude_widget_from_capture(self.floating_control)
+        except RuntimeError as exc:
+            _log.debug("Skipping topmost maintenance on deleted widget: %s", exc)
+            self.topmost_timer.stop()
 
     def _refresh_timeline(self) -> None:
         count = self.project.frame_count()
@@ -828,7 +1065,7 @@ class MainWindow(QMainWindow):
         if count == 0:
             self._last_preview_frame = None
             self.preview_label.setPixmap(QPixmap())
-            self.preview_label.setText("Preview appears here after frames are recorded")
+            self.preview_label.setText(self._preview_hint_text())
             return
 
         path = self.project.preview_frame_path(index)
@@ -838,7 +1075,11 @@ class MainWindow(QMainWindow):
             self.preview_label.setText("Preview unavailable")
             return
 
-        frame = cv2.imread(str(path))
+        try:
+            frame = cv2.imread(str(path))
+        except Exception as exc:
+            _log.warning("Preview cv2.imread raised on %s: %s", path, exc)
+            frame = None
         if frame is None:
             self._last_preview_frame = None
             self.preview_label.setPixmap(QPixmap())
@@ -861,23 +1102,23 @@ class MainWindow(QMainWindow):
     def _cut_label_text(self) -> str:
         start, end = self.project.cut_start, self.project.cut_end
         if start is None and end is None:
-            return "Trim range: none"
+            return "Trim: none"
         if start is None:
-            return f"Trim range: Mark Out set at {format_seconds(end / self.project.fps)}. Set Mark In next."
+            return f"Trim: end at {format_seconds(end / self.project.fps)} — set start next"
         if end is None:
-            return f"Trim range: Mark In set at {format_seconds(start / self.project.fps)}. Set Mark Out next."
+            return f"Trim: start at {format_seconds(start / self.project.fps)} — set end next"
 
         lo, hi = sorted((start, end))
         duration = (hi - lo) / self.project.fps
         if lo == hi:
-            return f"Trim range: empty at {format_seconds(lo / self.project.fps)}"
+            return f"Trim: empty at {format_seconds(lo / self.project.fps)}"
         return (
-            f"Trim range: {format_seconds(lo / self.project.fps)} → "
+            f"Trim: {format_seconds(lo / self.project.fps)} → "
             f"{format_seconds(hi / self.project.fps)} ({format_seconds(duration)})"
         )
 
     def _update_status(self, text: str) -> None:
-        self.setWindowTitle(f"{APP_NAME} — {text}")
+        self.status_bar.showMessage(text)
 
     def _update_controls(self) -> None:
         state = self.project.state
@@ -889,14 +1130,14 @@ class MainWindow(QMainWindow):
         can_edit = not recording and has_frames
 
         self.select_button.setEnabled(not recording and not busy and not playing)
-        self.record_button.setEnabled(has_area and not busy and not playing and state is not RecorderState.RECORDING)
+        self.record_button.setEnabled(has_area and not recording and not busy and not playing)
         self.play_preview_button.setEnabled(can_edit and not busy)
         if playing:
             self.play_preview_button.setIcon(self._icon("mdi6.stop"))
-            self.play_preview_button.setText(" Stop")
+            self.play_preview_button.setText(" Stop  (Space)")
         else:
             self.play_preview_button.setIcon(self._icon("mdi6.play"))
-            self.play_preview_button.setText(" Play")
+            self.play_preview_button.setText(" Play  (Space)")
         self.stop_button.setEnabled(state is RecorderState.PAUSED and not busy and not playing)
         self.save_button.setEnabled(can_edit and not busy and not playing)
         self.import_button.setEnabled(not recording and not busy and not playing)
@@ -928,10 +1169,36 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         self._scale_preview_to_label()
 
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        exclude_widget_from_capture(self)
+
     def closeEvent(self, event) -> None:  # noqa: N802
-        self.preview_ctrl.stop()
-        self._stop_worker()
-        self.audio.stop_recording(end_frame=self.project.frame_count())
+        self.topmost_timer.stop()
+
+        if self._import_worker is not None and self._import_worker.isRunning():
+            self._import_worker.cancel()
+            self._import_worker.wait(2000)
+        if self._export_worker is not None and self._export_worker.isRunning():
+            self._export_worker.wait(5000)
+
+        try:
+            self.preview_ctrl.stop()
+        except Exception:
+            _log.exception("preview stop failed during close")
+
+        try:
+            if self.project.state is RecorderState.RECORDING and self.capture_worker is not None:
+                self.capture_worker.stop()
+                self.capture_worker.wait(3000)
+        except Exception:
+            _log.exception("capture stop failed during close")
+
+        try:
+            self.audio.stop_recording(end_frame=self.project.frame_count())
+        except Exception:
+            _log.exception("audio stop failed during close")
+
         if self.project.state is RecorderState.RECORDING:
             self.project.state = RecorderState.PAUSED if self.project.has_frames() else RecorderState.IDLE
         self.project.set_timeline_index(self.project.frame_count())
@@ -942,6 +1209,8 @@ class MainWindow(QMainWindow):
             else:
                 self.autosaver.clear()
         except Exception as exc:
+            _log.exception("autosave failed during close")
+            self.topmost_timer.start()
             QMessageBox.critical(
                 self, APP_NAME,
                 f"Could not save the local recording project for restore.\n\n"
@@ -950,6 +1219,17 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
 
-        self.area_overlay.close()
-        self.floating_control.close()
+        try:
+            self._stop_worker()
+        except Exception:
+            _log.exception("_stop_worker failed during close")
+
+        try:
+            self.area_overlay.close()
+        except Exception:
+            pass
+        try:
+            self.floating_control.close()
+        except Exception:
+            pass
         event.accept()
