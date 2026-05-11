@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import os
 import subprocess
@@ -570,20 +571,27 @@ class MainWindow(QMainWindow):
         else:
             self._start_recording()
 
-    def _with_transition(self, expected: RecorderState, action: callable) -> None:
-        if self.project.state is not expected:
-            return
-        self.preview_ctrl.stop()
+    @contextlib.contextmanager
+    def _transitioning(self):
         if self._state_transitioning:
+            yield False
             return
         self._state_transitioning = True
         self._update_controls()
         QApplication.processEvents()
         try:
-            action()
+            yield True
         finally:
             self._state_transitioning = False
             self._update_controls()
+
+    def _with_transition(self, expected: RecorderState, action: callable) -> None:
+        if self.project.state is not expected:
+            return
+        self.preview_ctrl.stop()
+        with self._transitioning() as entered:
+            if entered:
+                action()
 
     def _start_recording(self) -> None:
         if self.project.area is None:
@@ -591,12 +599,9 @@ class MainWindow(QMainWindow):
             return
         if self.project.state is RecorderState.RECORDING:
             return
-        if self._state_transitioning:
-            return
-        self._state_transitioning = True
-        self._update_controls()
-        QApplication.processEvents()
-        try:
+        with self._transitioning() as entered:
+            if not entered:
+                return
             if self.project.has_frames():
                 reply = QMessageBox.question(
                     self, APP_NAME,
@@ -613,9 +618,6 @@ class MainWindow(QMainWindow):
             self.project.set_timeline_index(0)
             self.project.reset_cut_marks()
             self._begin_capture()
-        finally:
-            self._state_transitioning = False
-            self._update_controls()
 
     def _pause_recording(self) -> None:
         def action():
@@ -908,15 +910,9 @@ class MainWindow(QMainWindow):
             self._update_status("Import failed")
 
     def _save_as(self) -> None:
-        if self._state_transitioning:
-            return
-        self._state_transitioning = True
-        self.save_button.setEnabled(False)
-        try:
-            self._save_as_impl()
-        finally:
-            self._state_transitioning = False
-            self._update_controls()
+        with self._transitioning() as entered:
+            if entered:
+                self._save_as_impl()
 
     def _save_as_impl(self) -> None:
         self.preview_ctrl.stop()
@@ -1092,10 +1088,7 @@ class MainWindow(QMainWindow):
         )
 
     def _update_status(self, text: str) -> None:
-        if hasattr(self, "status_bar"):
-            self.status_bar.showMessage(text)
-        else:
-            self.setWindowTitle(f"{APP_NAME} — {text}")
+        self.status_bar.showMessage(text)
 
     def _update_controls(self) -> None:
         state = self.project.state
@@ -1107,7 +1100,7 @@ class MainWindow(QMainWindow):
         can_edit = not recording and has_frames
 
         self.select_button.setEnabled(not recording and not busy and not playing)
-        self.record_button.setEnabled(has_area and not busy and not playing and state is not RecorderState.RECORDING)
+        self.record_button.setEnabled(has_area and not recording and not busy and not playing)
         self.play_preview_button.setEnabled(can_edit and not busy)
         if playing:
             self.play_preview_button.setIcon(self._icon("mdi6.stop"))

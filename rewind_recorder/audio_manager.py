@@ -22,14 +22,13 @@ class AudioManager:
         frame_count: int,
         input_device: int | None,
         output_device: str | None,
-        input_sample_rate: int | None = None,
     ) -> tuple[bool, list[str]]:
         self.stop_recording(end_frame=frame_count)
         self.current_start_frame = frame_count
 
         mic = LocalMicrophoneRecorder(
             output_dir=temp_dir,
-            sample_rate=input_sample_rate or self._default_input_sample_rate(input_device),
+            sample_rate=self._default_input_sample_rate(input_device),
             channels=AUDIO_CHANNELS,
             device=input_device,
         )
