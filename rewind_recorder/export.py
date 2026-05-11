@@ -36,6 +36,7 @@ class VideoExporter:
         self.output_width = DEFAULT_OUTPUT_WIDTH
         self.output_height = DEFAULT_OUTPUT_HEIGHT
         self._ffmpeg_path: str | None | object = _UNRESOLVED
+        self._canvas: np.ndarray | None = None
 
     def export(
         self,
@@ -44,23 +45,27 @@ class VideoExporter:
         output_path: Path,
     ) -> ExportResult:
         video_path, used_fallback = self._render_video(frame_paths, output_path)
-        audio_path = self.build_audio_mix(
-            video_path.with_suffix(".wav"),
-            segments,
-            len(frame_paths),
-        )
-
-        if audio_path is None:
-            return ExportResult(path=video_path, used_fallback_codec=used_fallback, audio_muxed=False)
-
-        final_path, muxed, detail = self._mux_audio(video_path, audio_path)
-        if not muxed:
-            audio_path.unlink(missing_ok=True)
-            raise RuntimeError(
-                "This recording has audio, but the audio could not be embedded into the video.\n\n"
-                f"{detail}"
+        audio_path: Path | None = None
+        try:
+            audio_path = self.build_audio_mix(
+                video_path.with_suffix(".wav"),
+                segments,
+                len(frame_paths),
             )
-        return ExportResult(path=final_path, used_fallback_codec=used_fallback, audio_muxed=True)
+
+            if audio_path is None:
+                return ExportResult(path=video_path, used_fallback_codec=used_fallback, audio_muxed=False)
+
+            final_path, muxed, detail = self._mux_audio(video_path, audio_path)
+            if not muxed:
+                raise RuntimeError(
+                    "This recording has audio, but the audio could not be embedded into the video.\n\n"
+                    f"{detail}"
+                )
+            return ExportResult(path=final_path, used_fallback_codec=used_fallback, audio_muxed=True)
+        finally:
+            if audio_path is not None:
+                audio_path.unlink(missing_ok=True)
 
     def build_audio_mix(
         self,
@@ -144,30 +149,33 @@ class VideoExporter:
         if not frame_paths:
             raise RuntimeError("No frames are available.")
 
+        first_idx = 0
         first_frame = None
-        for candidate in frame_paths:
+        for i, candidate in enumerate(frame_paths):
             try:
                 first_frame = cv2.imread(str(candidate))
             except Exception as exc:
                 _log.warning("cv2.imread raised on %s: %s", candidate, exc)
                 first_frame = None
             if first_frame is not None:
+                first_idx = i
                 break
         if first_frame is None:
             raise RuntimeError("Could not read any recorded frame.")
 
+        usable_paths = frame_paths[first_idx:]
         height, width = first_frame.shape[:2]
         fps = float(self.fps)
 
         if requested_path.suffix.lower() == ".avi":
-            return self._write_video(requested_path, "XVID", frame_paths, fps, width, height), False
+            return self._write_video(requested_path, "XVID", usable_paths, fps, width, height), False
 
         mp4_path = requested_path.with_suffix(".mp4")
         try:
-            return self._write_video(mp4_path, "mp4v", frame_paths, fps, width, height), False
+            return self._write_video(mp4_path, "mp4v", usable_paths, fps, width, height), False
         except VideoWriterOpenError:
             avi_path = self._unique_path(requested_path.with_suffix(".avi"))
-            return self._write_video(avi_path, "XVID", frame_paths, fps, width, height), True
+            return self._write_video(avi_path, "XVID", usable_paths, fps, width, height), True
 
     def _write_video(
         self,
@@ -229,7 +237,12 @@ class VideoExporter:
         scaled_h -= scaled_h % 2
 
         resized = cv2.resize(frame, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
-        canvas = np.zeros((self.output_height, self.output_width, 3), dtype=np.uint8)
+        canvas = self._canvas
+        if canvas is None or canvas.shape != (self.output_height, self.output_width, 3):
+            canvas = np.zeros((self.output_height, self.output_width, 3), dtype=np.uint8)
+            self._canvas = canvas
+        else:
+            canvas[:] = 0
         x = (self.output_width - scaled_w) // 2
         y = (self.output_height - scaled_h) // 2
         canvas[y : y + scaled_h, x : x + scaled_w] = resized
@@ -244,16 +257,12 @@ class VideoExporter:
         temp_output = final_path.with_name(f"{final_path.stem}_with_audio_tmp{final_path.suffix}")
         temp_output.unlink(missing_ok=True)
 
-        if video_path.suffix.lower() == ".mp4":
-            video_codec_args = ["-c:v", "copy"]
-        else:
-            video_codec_args = ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p"]
-
         command = [
             ffmpeg, "-y",
             "-i", str(video_path),
             "-i", str(audio_path),
-            *video_codec_args,
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
             "-c:a", "aac", "-b:a", "192k",
             str(temp_output),
         ]
@@ -267,10 +276,13 @@ class VideoExporter:
             final_path.unlink(missing_ok=True)
         if final_path == video_path:
             video_path.unlink(missing_ok=True)
-        temp_output.replace(final_path)
+        try:
+            temp_output.replace(final_path)
+        except OSError as exc:
+            temp_output.unlink(missing_ok=True)
+            return video_path, False, f"Could not move {temp_output.name} to {final_path}: {exc}"
         if video_path != final_path:
             video_path.unlink(missing_ok=True)
-        audio_path.unlink(missing_ok=True)
         return final_path, True, ""
 
     def _build_silent_audio(self, output_path: Path, duration_seconds: float) -> Path | None:

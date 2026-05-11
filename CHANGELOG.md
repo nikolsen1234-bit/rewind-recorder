@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-11
+
+### Fixed
+
+- Importing a clip no longer freezes the UI. Runs on a background `QThread` with live progress in the status bar. Window stays responsive; close-during-import cleanly cancels.
+- Exporting no longer freezes the UI. Same background-thread pattern; status bar shows "Saving…" while ffmpeg works.
+- Exported MP4 files are now H.264 (libx264 + AAC + `+faststart` moov) on every path, not just the AVI fallback. Previously the common path used the cv2 `mp4v` codec which produces non-baseline-profile MP4s that some browsers, Slack previews, and quick-look players refuse to play.
+- Imported clip's source FPS is now read and the user is warned if it differs from the project FPS by more than 0.5 (previously the timeline silently played at the wrong speed).
+- Cap on imported frame count (36 000 ≈ 10 min @ 60 fps) prevents the user from accidentally filling temp disk with a multi-GB 4K source.
+- `_render_video`'s first-frame-search no longer re-iterates skipped frames in the main write loop (small perf, but correctness too — skipped paths were tried twice).
+- `_mux_audio` `temp_output.replace(final_path)` now catches `OSError` (file locked by a media player) and reports it instead of crashing.
+- Audio mix WAV file is now reliably cleaned up on every export path (success, mux failure, render failure) via a single `try/finally` in `export()`.
+- Re-entrant import/export blocked: the buttons are disabled while a worker runs.
+
+### Changed
+
+- Pre-allocated and reused the letterbox canvas in `VideoExporter._frame_to_canvas` (was allocating a fresh 1920×1080×3 numpy array per frame; for a 10-min 60 fps render that was ~36 000 × 6 MB = ~220 GB of allocator churn).
+- New `rewind_recorder/workers.py` with `ImportClipWorker` and `ExportWorker`. Both expose `progress`, `finished_ok`, `failed` signals.
+- Bump to 0.3.0 (minor — visible behavior changes around imported-clip warnings and the new H.264 export default).
+
 ## [0.2.0] - 2026-05-11
 
 ### Added
@@ -80,7 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Export as MP4.
 - Autosave while recording.
 
-[Unreleased]: https://github.com/nikolsen1234-bit/rewind-recorder/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/nikolsen1234-bit/rewind-recorder/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/nikolsen1234-bit/rewind-recorder/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/nikolsen1234-bit/rewind-recorder/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/nikolsen1234-bit/rewind-recorder/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/nikolsen1234-bit/rewind-recorder/compare/v0.1.0...v0.1.1

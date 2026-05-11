@@ -26,11 +26,13 @@ from PySide6.QtWidgets import (
 )
 
 _log = logging.getLogger(__name__)
+_IMPORT_FRAME_CAP = 36_000
 
 from rewind_recorder import __version__
 from rewind_recorder.audio_manager import AudioManager
 from rewind_recorder.paths import log_dir, log_path
 from rewind_recorder.qtutil import safe_disconnect
+from rewind_recorder.workers import ExportWorker, ImportClipWorker
 from rewind_recorder.autosave import AutosaveManager
 from rewind_recorder.capture import CaptureWorker
 from rewind_recorder.config import APP_NAME, DEFAULT_FPS, RecorderState
@@ -112,6 +114,8 @@ class MainWindow(QMainWindow):
 
         self.capture_worker: CaptureWorker | None = None
         self._zombie_workers: list[CaptureWorker] = []
+        self._import_worker: ImportClipWorker | None = None
+        self._export_worker: ExportWorker | None = None
         self.selector: AreaSelector | None = None
         self.area_overlay = CaptureAreaOverlay()
         self.floating_control = FloatingRecorderControl()
@@ -869,6 +873,8 @@ class MainWindow(QMainWindow):
         if self.project.state is RecorderState.RECORDING:
             QMessageBox.warning(self, APP_NAME, "Pause or stop recording before importing.")
             return
+        if self._import_worker is not None or self._export_worker is not None:
+            return
 
         filename, _ = QFileDialog.getOpenFileName(
             self, "Import Video Clip", str(Path.home() / "Videos"),
@@ -877,50 +883,66 @@ class MainWindow(QMainWindow):
         if not filename:
             return
 
-        self._update_status("Importing...")
-        QApplication.processEvents()
+        clip_path = Path(filename)
+        worker = ImportClipWorker(self.project, clip_path, _IMPORT_FRAME_CAP)
+        worker.progress.connect(self._on_import_progress)
+        worker.finished_ok.connect(self._on_import_finished)
+        worker.failed.connect(self._on_import_failed)
+        worker.finished.connect(lambda w=worker: self._reap_finished_thread(w, "_import_worker"))
 
-        try:
-            cap = cv2.VideoCapture(filename)
-            if not cap.isOpened():
-                raise RuntimeError(f"Could not open video file: {filename}")
+        self._import_worker = worker
+        self._state_transitioning = True
+        self._update_status(f"Importing {clip_path.name}…")
+        self._update_controls()
+        worker.start()
 
-            imported = 0
-            while True:
-                ok, frame = cap.read()
-                if not ok:
-                    break
-                self.project.add_frame(frame)
-                imported += 1
+    def _on_import_progress(self, done: int, total: int) -> None:
+        if total > 0:
+            self._update_status(f"Importing… {done}/{total} frames")
+        else:
+            self._update_status(f"Importing… {done} frames")
 
-            cap.release()
-
-            if imported == 0:
-                QMessageBox.warning(self, APP_NAME, "No frames could be read from the selected video.")
-                return
-
-            if self.project.state is RecorderState.IDLE:
-                self.project.state = RecorderState.PAUSED
-            self.project.set_timeline_index(self.project.frame_count())
-            self._refresh_timeline()
-            self._update_status(f"Imported {imported} frames from {Path(filename).name}")
-            self._update_controls()
-        except Exception as exc:
-            QMessageBox.critical(self, APP_NAME, f"Could not import video:\n\n{exc}")
+    def _on_import_finished(self, imported: int, source_fps: float) -> None:
+        if imported == 0:
+            QMessageBox.warning(self, APP_NAME, "No frames could be read from the selected video.")
             self._update_status("Import failed")
+            return
+
+        if self.project.state is RecorderState.IDLE:
+            self.project.state = RecorderState.PAUSED
+        self.project.set_timeline_index(self.project.frame_count())
+        self._refresh_timeline()
+
+        msg = f"Imported {imported} frames"
+        if imported >= _IMPORT_FRAME_CAP:
+            msg += f" (capped at {_IMPORT_FRAME_CAP} — clip was longer)"
+        self._update_status(msg)
+        if source_fps > 0 and abs(source_fps - self.project.fps) > 0.5:
+            QMessageBox.warning(
+                self, APP_NAME,
+                f"Imported clip is {source_fps:.2f} fps but project is {self.project.fps} fps. "
+                f"Playback and export will use the project rate, so timing may not match the source.",
+            )
+
+    def _on_import_failed(self, message: str) -> None:
+        QMessageBox.critical(self, APP_NAME, f"Could not import video:\n\n{message}")
+        self._update_status("Import failed")
+
+    def _reap_finished_thread(self, worker, attr: str) -> None:
+        if getattr(self, attr, None) is worker:
+            setattr(self, attr, None)
+        self._state_transitioning = False
+        self._update_controls()
 
     def _save_as(self) -> None:
-        with self._transitioning() as entered:
-            if entered:
-                self._save_as_impl()
-
-    def _save_as_impl(self) -> None:
         self.preview_ctrl.stop()
         if self.project.state is RecorderState.RECORDING:
             QMessageBox.warning(self, APP_NAME, "Pause or stop recording before saving.")
             return
         if not self.project.has_frames():
             QMessageBox.warning(self, APP_NAME, "There are no recorded frames to save.")
+            return
+        if self._import_worker is not None or self._export_worker is not None:
             return
 
         default_dir = Path.home() / "Videos"
@@ -937,26 +959,29 @@ class MainWindow(QMainWindow):
         if output_path.suffix.lower() != ".mp4":
             output_path = output_path.with_suffix(".mp4")
 
-        try:
-            self._update_status("Saving...")
-            QApplication.processEvents()
-            result = self.exporter.export(
-                self.project.snapshot_frame_paths(),
-                self.audio.mix_segments(),
-                output_path,
-            )
-        except Exception as exc:
-            _log.exception("Export failed")
-            QMessageBox.critical(self, APP_NAME, f"Could not save recording:\n\n{exc}")
-            self._update_status("Save failed")
-            return
+        worker = ExportWorker(
+            self.exporter,
+            self.project.snapshot_frame_paths(),
+            self.audio.mix_segments(),
+            output_path,
+        )
+        worker.progress.connect(self._update_status)
+        worker.finished_ok.connect(self._on_export_finished)
+        worker.failed.connect(self._on_export_failed)
+        worker.finished.connect(lambda w=worker: self._reap_finished_thread(w, "_export_worker"))
 
+        self._export_worker = worker
+        self._state_transitioning = True
+        self._update_status("Saving…")
+        self._update_controls()
+        worker.start()
+
+    def _on_export_finished(self, result) -> None:
         self.audio.clear(delete_files=True)
         self.project.clear_frames()
         self.autosaver.clear()
         self.project.state = RecorderState.IDLE
         self._refresh_timeline()
-        self._update_controls()
         self.area_overlay.hide()
         self.floating_control.hide()
 
@@ -974,6 +999,11 @@ class MainWindow(QMainWindow):
             msg += "\n\n" + "\n\n".join(notes)
         QMessageBox.information(self, APP_NAME, msg)
         self._update_status("Saved")
+
+    def _on_export_failed(self, message: str) -> None:
+        _log.error("Export failed: %s", message)
+        QMessageBox.critical(self, APP_NAME, f"Could not save recording:\n\n{message}")
+        self._update_status("Save failed")
 
     def _sync_overlay(self, apply_geometry: bool = False) -> None:
         if self.project.area is None:
@@ -1145,6 +1175,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self.topmost_timer.stop()
+
+        if self._import_worker is not None and self._import_worker.isRunning():
+            self._import_worker.cancel()
+            self._import_worker.wait(2000)
+        if self._export_worker is not None and self._export_worker.isRunning():
+            self._export_worker.wait(5000)
 
         try:
             self.preview_ctrl.stop()
