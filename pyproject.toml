@@ -49,3 +49,10 @@ include = ["rewind_recorder*"]
 [tool.vulture]
 paths = ["rewind_recorder", ".vulture_whitelist.py"]
 min_confidence = 60
+
+[tool.deptry]
+known_first_party = ["rewind_recorder"]
+[tool.deptry.package_module_name_map]
+opencv-python = "cv2"
+PySide6 = "PySide6"
+imageio-ffmpeg = "imageio_ffmpeg"
