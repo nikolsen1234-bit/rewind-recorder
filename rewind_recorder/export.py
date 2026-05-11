@@ -10,8 +10,11 @@ import cv2
 import numpy as np
 
 from rewind_recorder.config import AUDIO_SAMPLE_RATE, DEFAULT_OUTPUT_HEIGHT, DEFAULT_OUTPUT_WIDTH
-from rewind_recorder.errors import VideoWriterOpenError
 from rewind_recorder.types import AudioSegment
+
+
+class VideoWriterOpenError(RuntimeError):
+    pass
 
 _log = logging.getLogger(__name__)
 _FFMPEG_TIMEOUT_SECONDS = 3600

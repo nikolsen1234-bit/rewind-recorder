@@ -44,12 +44,6 @@ class PreviewController(QObject):
     def set_fps(self, fps: float) -> None:
         self._timer.setInterval(max(1, int(round(1000 / max(1.0, float(fps))))))
 
-    def toggle(self) -> None:
-        if self.is_playing:
-            self.stop()
-        else:
-            self.start()
-
     def start(self, speaker_id: str | None = None) -> None:
         self.stop()
 

@@ -71,12 +71,12 @@ class AudioManager:
         self.current_start_frame = None
 
         for source_name, recorder in recorders:
-            audio_info = recorder.stop()
+            recorder.stop()
             if not keep:
                 recorder.cleanup(delete_file=True)
                 continue
 
-            if audio_info.output_path is None or audio_info.frames_written <= 0:
+            if recorder.output_path is None or recorder.frames_written <= 0:
                 recorder.cleanup(delete_file=True)
                 continue
 
@@ -87,15 +87,15 @@ class AudioManager:
                 continue
 
             self.segments.append(AudioSegment(
-                path=Path(audio_info.output_path),
+                path=Path(recorder.output_path),
                 source_name=source_name,
                 record_start_frame=start,
                 source_start_frame=start,
                 source_end_frame=end,
                 timeline_start_frame=start,
                 timeline_end_frame=end,
-                sample_rate=audio_info.sample_rate,
-                channels=audio_info.channels,
+                sample_rate=recorder.sample_rate,
+                channels=recorder.channels,
             ))
 
     def discard_after(self, frame_index: int) -> None:
