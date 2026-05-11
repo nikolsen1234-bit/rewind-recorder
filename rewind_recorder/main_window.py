@@ -28,6 +28,8 @@ _log = logging.getLogger(__name__)
 
 from rewind_recorder import __version__
 from rewind_recorder.audio_manager import AudioManager
+from rewind_recorder.paths import log_dir, log_path
+from rewind_recorder.qtutil import safe_disconnect
 from rewind_recorder.autosave import AutosaveManager
 from rewind_recorder.capture import CaptureWorker
 from rewind_recorder.config import APP_NAME, DEFAULT_FPS, RecorderState
@@ -97,7 +99,6 @@ _TIME_STYLE = (
     "padding: 4px 12px; background: #0e0e0e; border: 1px solid #2a2a2a; "
     "border-radius: 6px; letter-spacing: 1px;"
 )
-_HINT_STYLE = "color: #999; font-size: 13px; line-height: 1.5em;"
 
 
 class MainWindow(QMainWindow):
@@ -152,7 +153,7 @@ class MainWindow(QMainWindow):
         self._refresh_timeline()
         self._update_controls()
 
-    def _icon(self, name: str) -> "QIcon":
+    def _icon(self, name: str):
         return qta.icon(name, color=QColor(200, 200, 200))
 
     def _build_ui(self) -> None:
@@ -417,36 +418,27 @@ class MainWindow(QMainWindow):
         return "Preview unavailable"
 
     def _open_logs_folder(self) -> None:
-        if sys.platform == "win32":
-            base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-        else:
-            base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-        log_dir = base / "RewindRecorder" / "logs"
+        target = log_dir()
         try:
-            log_dir.mkdir(parents=True, exist_ok=True)
+            target.mkdir(parents=True, exist_ok=True)
             if sys.platform == "win32":
-                os.startfile(str(log_dir))  # type: ignore[attr-defined]
+                os.startfile(str(target))  # type: ignore[attr-defined]
             elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(log_dir)])
+                subprocess.Popen(["open", str(target)])
             else:
-                subprocess.Popen(["xdg-open", str(log_dir)])
+                subprocess.Popen(["xdg-open", str(target)])
         except Exception as exc:
             _log.exception("Could not open logs folder")
-            QMessageBox.warning(self, APP_NAME, f"Could not open logs folder:\n{log_dir}\n\n{exc}")
+            QMessageBox.warning(self, APP_NAME, f"Could not open logs folder:\n{target}\n\n{exc}")
 
     def _show_about(self) -> None:
-        if sys.platform == "win32":
-            base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-        else:
-            base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-        log_path = base / "RewindRecorder" / "logs" / "rewind_recorder.log"
         QMessageBox.about(
             self, f"About {APP_NAME}",
             f"<h3>{APP_NAME}</h3>"
             f"<p>Version {__version__}</p>"
             f"<p>Local Windows screen recorder with rewind-and-overwrite editing. "
             f"Nothing leaves your machine.</p>"
-            f"<p><b>Logs:</b><br><code>{log_path}</code></p>"
+            f"<p><b>Logs:</b><br><code>{log_path()}</code></p>"
             f"<p><a href=\"https://github.com/nikolsen1234-bit/rewind-recorder\">"
             f"github.com/nikolsen1234-bit/rewind-recorder</a></p>"
             f"<p><b>Shortcuts</b><br>"
@@ -701,18 +693,9 @@ class MainWindow(QMainWindow):
             self._reap_zombie_workers()
             return
 
-        try:
-            worker.frame_saved.disconnect(self._on_frame_saved)
-        except (RuntimeError, TypeError):
-            pass
-        try:
-            worker.capture_error.disconnect(self._on_capture_error)
-        except (RuntimeError, TypeError):
-            pass
-        try:
-            worker.finished.disconnect(self._on_worker_finished)
-        except (RuntimeError, TypeError):
-            pass
+        safe_disconnect(worker.frame_saved, self._on_frame_saved)
+        safe_disconnect(worker.capture_error, self._on_capture_error)
+        safe_disconnect(worker.finished, self._on_worker_finished)
 
         worker.stop()
         worker.wait(3000)

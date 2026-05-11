@@ -45,3 +45,7 @@ rewind-recorder = "rewind_recorder.app:main"
 
 [tool.setuptools.packages.find]
 include = ["rewind_recorder*"]
+
+[tool.vulture]
+paths = ["rewind_recorder", ".vulture_whitelist.py"]
+min_confidence = 60

@@ -7,6 +7,7 @@ from rewind_recorder.audio_manager import AudioManager
 from rewind_recorder.export import VideoExporter
 from rewind_recorder.playback import AudioPlaybackWorker
 from rewind_recorder.project import FrameProject
+from rewind_recorder.qtutil import safe_disconnect
 
 
 class PreviewController(QObject):
@@ -107,14 +108,8 @@ class PreviewController(QObject):
         worker = self._audio_worker
         self._audio_worker = None
         if worker is not None:
-            try:
-                worker.playback_error.disconnect(self._on_audio_error)
-            except (RuntimeError, TypeError):
-                pass
-            try:
-                worker.finished.disconnect(self._on_audio_finished)
-            except (RuntimeError, TypeError):
-                pass
+            safe_disconnect(worker.playback_error, self._on_audio_error)
+            safe_disconnect(worker.finished, self._on_audio_finished)
             worker.stop(wait_ms=2000)
 
         if was_playing:

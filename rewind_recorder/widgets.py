@@ -163,7 +163,6 @@ class FloatingRecorderControl(QWidget):
         self._drag_offset: QPoint | None = None
         self._drag_start: QPoint | None = None
         self._drag_started = False
-        self._is_recording = False
         self._pulse_on = False
 
         self._pulse_timer = QTimer(self)
@@ -259,7 +258,6 @@ class FloatingRecorderControl(QWidget):
 
         if state is RecorderState.RECORDING:
             self.primary_button.setText("⏸  Pause")
-            self._is_recording = True
             if not self._pulse_timer.isActive():
                 self._pulse_timer.start()
             self._apply_button_style(self._RECORDING_COLOR)
@@ -293,7 +291,6 @@ class FloatingRecorderControl(QWidget):
     def _stop_pulse(self) -> None:
         self._pulse_timer.stop()
         self._pulse_on = False
-        self._is_recording = False
 
     def _apply_button_style(self, color: str) -> None:
         self.primary_button.setStyleSheet(

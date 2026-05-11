@@ -173,7 +173,6 @@ class LocalMicrophoneRecorder(BaseAudioRecorder):
         self._wave_file: wave.Wave_write | None = None
         self._writer_thread: threading.Thread | None = None
         self._writer_queue: queue.Queue[bytes | None] | None = None
-        self._sd: Any | None = None
         self._dropped_blocks = 0
 
     @property
@@ -193,7 +192,6 @@ class LocalMicrophoneRecorder(BaseAudioRecorder):
 
             try:
                 sd = self._import_sounddevice()
-                self._sd = sd
                 self.channels = self._available_channel_count(sd)
 
                 self._output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -289,7 +287,7 @@ class LocalMicrophoneRecorder(BaseAudioRecorder):
 
         return min(self.requested_channels, max_channels)
 
-    def _on_audio_block(self, indata: Any, frames: int, time_info: Any, status: Any) -> None:
+    def _on_audio_block(self, indata: Any, frames: int, _time_info: Any, status: Any) -> None:
         if status:
             self._last_status = str(status)
 
